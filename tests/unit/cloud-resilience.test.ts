@@ -3,6 +3,7 @@ import { onRequest as hetopPagesProxyOnRequest } from '../../functions/api/hetop
 import {
   queryAiModel,
   extractJsonFromLlmResponse,
+  parseScreeningResponse,
   aiScreenBatchArticles,
   aiRefinePicoFromAudit,
   saveAiConfig,
@@ -673,7 +674,7 @@ describe('Suite TDD · Résilience Cloud Multi-Fournisseurs, Parsing JSON, Cache
   // BLOC 4 : Annulation Propre d'un Lot Parallèle en Étape 3 via AbortController
   // ===========================================================================
   describe('4. Annulation propre d’un lot parallèle en Étape 3 via AbortController', () => {
-    it('doit annuler proprement entre deux vagues parallèles (45 articles : vague 1 complète, vague 2 jamais envoyée et 5 derniers en pending)', async () => {
+    it('doit annuler proprement entre deux vagues parallèles (29 articles : vague 1 de 2x12 complète, vague 2 jamais envoyée et 5 derniers en pending)', async () => {
       saveAiConfig({
         provider: 'openai',
         routingMode: 'smart',
@@ -682,21 +683,21 @@ describe('Suite TDD · Résilience Cloud Multi-Fournisseurs, Parsing JSON, Cache
       });
 
       const controller = new AbortController();
-      const articles = makeSampleArticles(45, 50000001);
+      const articles = makeSampleArticles(29, 50000001);
       let fetchCalls = 0;
 
       const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
         fetchCalls++;
         const callIndex = fetchCalls;
-        const startOffset = (callIndex - 1) * 20;
-        const payload = articles.slice(startOffset, startOffset + 20).map(a => ({
+        const startOffset = (callIndex - 1) * 12;
+        const payload = articles.slice(startOffset, startOffset + 12).map(a => ({
           pmid: a.pmid,
           status: 'included',
           evidenceSnippet: 'Conforme'
         }));
 
         if (callIndex === 2) {
-          // Déclenche l'annulation juste à la fin de la vague 1 (2 lots de 20)
+          // Déclenche l'annulation juste à la fin de la vague 1 (2 lots de 12)
           controller.abort();
         }
         void init;
@@ -713,13 +714,13 @@ describe('Suite TDD · Résilience Cloud Multi-Fournisseurs, Parsing JSON, Cache
       );
 
       expect(fetchCalls).toBe(2);
-      expect(report.screenedArticles).toHaveLength(45);
-      expect(report.totalIncluded).toBe(40);
+      expect(report.screenedArticles).toHaveLength(29);
+      expect(report.totalIncluded).toBe(24);
       expect(report.totalPending).toBe(5);
-      expect(report.screenedArticles.slice(40).every(a => a.status === 'pending')).toBe(true);
+      expect(report.screenedArticles.slice(24).every(a => a.status === 'pending')).toBe(true);
     });
 
-    it('doit propager AbortSignal aux appels fetch en plein vol et laisser les 40 articles en statut pending lors de controller.abort()', async () => {
+    it('doit propager AbortSignal aux appels fetch en plein vol et laisser les 24 articles en statut pending lors de controller.abort()', async () => {
       saveAiConfig({
         provider: 'openai',
         routingMode: 'smart',
@@ -728,7 +729,7 @@ describe('Suite TDD · Résilience Cloud Multi-Fournisseurs, Parsing JSON, Cache
       });
 
       const controller = new AbortController();
-      const articles = makeSampleArticles(40, 60000001);
+      const articles = makeSampleArticles(24, 60000001);
       const capturedSignals: Array<AbortSignal | undefined> = [];
       let waveStartedResolve: (() => void) | null = null;
       const waveStarted = new Promise<void>(resolve => {
@@ -748,7 +749,7 @@ describe('Suite TDD · Résilience Cloud Multi-Fournisseurs, Parsing JSON, Cache
             resolve(
               makeOpenAiOk(
                 JSON.stringify(
-                  articles.slice(0, 20).map(a => ({
+                  articles.slice(0, 12).map(a => ({
                     pmid: a.pmid,
                     status: 'included',
                     evidenceSnippet: 'Traité car signal non propagé'
@@ -800,8 +801,137 @@ describe('Suite TDD · Résilience Cloud Multi-Fournisseurs, Parsing JSON, Cache
 
       expect(capturedSignals.length).toBeGreaterThanOrEqual(2);
       expect(capturedSignals.some(sig => Boolean(sig?.aborted))).toBe(true);
-      expect(report.totalPending).toBe(40);
+      expect(report.totalPending).toBe(24);
       expect(report.screenedArticles.every(a => a.status === 'pending')).toBe(true);
+    });
+
+    it('Gemini Structured Outputs + parseScreeningResponse + bisection automatique et isolation par sous-lot (allSettled)', async () => {
+      // 1. parseScreeningResponse nettoie balises Markdown, caractères de contrôle et filtre les entrées invalides
+      const dirtyRaw =
+        '```json\nPréface inutile\n[{"pmid":"70000001","status":"included","evidenceSnippet":"ECR\u0007 valide"},{"pmid":"","status":"included","evidenceSnippet":"Sans PMID"},{"pmid":"70000002","status":"invalid_status","evidenceSnippet":"Statut invalide"},{"pmid":"70000003","status":"excluded","exclusionCategory":"preclinical","evidenceSnippet":"Modèle murin"}]\n```';
+      const cleaned = parseScreeningResponse(dirtyRaw);
+      expect(cleaned).toHaveLength(2);
+      expect(cleaned[0].pmid).toBe('70000001');
+      expect(cleaned[1].pmid).toBe('70000003');
+      expect(cleaned[1].exclusionCategory).toBe('preclinical');
+
+      // 2. Vérifie que Gemini reçoit bien maxOutputTokens: 8192 et responseSchema strict + bisection sur échec JSON
+      saveAiConfig({
+        provider: 'gemini',
+        routingMode: 'smart',
+        rateLimitMode: 'payg',
+        geminiApiKey: 'AIzaSyTestStructuredScreening'
+      });
+
+      const articles = makeSampleArticles(16, 71000001); // 2 sous-lots : 12 + 4
+      let capturedGenConfig: Record<string, unknown> | null = null;
+      let secondBatchAttempts = 0;
+
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = String(input);
+        if (url.includes('/v1beta/models?')) {
+          return makeJsonResponse(200, { models: [] });
+        }
+        const body = parseBodyJson(init);
+        if (!capturedGenConfig && body.generationConfig && typeof body.generationConfig === 'object') {
+          capturedGenConfig = body.generationConfig as Record<string, unknown>;
+        }
+
+        const promptText = JSON.stringify(body);
+        // Premier sous-lot (contient 71000001) : succès immédiat (12 notices)
+        if (promptText.includes('71000001')) {
+          return makeGeminiOk(
+            JSON.stringify(
+              articles.slice(0, 12).map(a => ({
+                pmid: a.pmid,
+                status: 'included',
+                evidenceSnippet: 'Lot 1 valide'
+              }))
+            )
+          );
+        }
+
+        // Second sous-lot (4 notices : 71000013..16) : échoue 2 fois sur le lot complet, puis réussit en bisection (2 + 2)
+        const matchingInSub = articles.slice(12).filter(a => promptText.includes(a.pmid));
+        if (matchingInSub.length === 4) {
+          secondBatchAttempts++;
+          return makeGeminiOk('[{"pmid":"71000013","status":"included","evidenceSnippet":"JSON cassé sans fin');
+        }
+        return makeGeminiOk(
+          JSON.stringify(
+            matchingInSub.map(a => ({
+              pmid: a.pmid,
+              status: 'excluded',
+              exclusionCategory: 'study_design',
+              evidenceSnippet: 'Revue narrative après bisection'
+            }))
+          )
+        );
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const streamedPmids: string[] = [];
+      const report = await runAgentScreeningDeep(
+        articles,
+        { p: 'Adultes', i: 'PRP', c: '', o: 'Douleur' },
+        undefined,
+        art => {
+          streamedPmids.push(art.pmid);
+        }
+      );
+
+      expect(capturedGenConfig?.['responseMimeType']).toBe('application/json');
+      expect(capturedGenConfig?.['maxOutputTokens']).toBe(8192);
+      expect(capturedGenConfig?.['responseSchema']).toBeDefined();
+      expect(secondBatchAttempts).toBe(2); // 1 essai initial + 1 retry avant bisection
+      expect(streamedPmids).toHaveLength(16);
+      expect(report.totalIncluded).toBe(12);
+      expect(report.totalExcluded).toBe(4);
+      expect(report.failedPendingCount).toBeUndefined();
+    });
+
+    it('doit conserver les lots valides et remonter failedPendingCount si un sous-lot réduit échoue encore après bisection', async () => {
+      saveAiConfig({
+        provider: 'openai',
+        routingMode: 'smart',
+        rateLimitMode: 'payg',
+        openaiApiKey: 'sk-test-partial-fail'
+      });
+
+      const articles = makeSampleArticles(14, 72000001); // 2 sous-lots : 12 + 2
+      const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const bodyStr = typeof init?.body === 'string' ? init.body : '';
+        if (bodyStr.includes('72000001')) {
+          return makeOpenAiOk(
+            JSON.stringify(
+              articles.slice(0, 12).map(a => ({
+                pmid: a.pmid,
+                status: 'included',
+                evidenceSnippet: 'Lot 1 acquis'
+              }))
+            )
+          );
+        }
+        // Le 2e sous-lot (2 notices) renvoie systématiquement un JSON invalide
+        return makeOpenAiOk('Réponse totalement invalide sans crochets');
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const streamedPmids: string[] = [];
+      const report = await runAgentScreeningDeep(
+        articles,
+        { p: 'Adultes', i: 'PRP', c: '', o: 'Douleur' },
+        undefined,
+        art => {
+          streamedPmids.push(art.pmid);
+        }
+      );
+
+      expect(streamedPmids).toHaveLength(12);
+      expect(report.totalIncluded).toBe(12);
+      expect(report.totalPending).toBe(2);
+      expect(report.failedPendingCount).toBe(2);
+      expect(report.lastErrorMessage).toBeTruthy();
     });
   });
 

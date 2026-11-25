@@ -321,7 +321,7 @@ export default function PrismaFlowchart({
     screeningAbortRef.current = controller;
 
     try {
-      await runAgentScreeningDeep(
+      const report = await runAgentScreeningDeep(
         pendingSlice,
         pico,
         (current, total, message) => {
@@ -333,6 +333,12 @@ export default function PrismaFlowchart({
         () => cancelScreeningRef.current,
         controller.signal
       );
+      if (report.failedPendingCount && report.failedPendingCount > 0) {
+        setFeedbackBanner({
+          kind: 'error',
+          text: `${report.lastErrorMessage || 'Erreur de dépouillement IA.'} (${report.failedPendingCount} notice(s) restée(s) en attente — les autres lots ont été enregistrés.)`
+        });
+      }
     } catch (err: unknown) {
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
         setFeedbackBanner({ kind: 'error', text: mapErrorToUserMessage(err) });

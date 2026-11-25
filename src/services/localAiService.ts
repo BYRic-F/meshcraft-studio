@@ -689,12 +689,34 @@ function hasConfiguredProviderKey(config: AiConfig, provider: CloudProvider): bo
   return Boolean(cleanApiKey(config.anthropicApiKey));
 }
 
+export interface GeminiSchemaProperty {
+  readonly type: 'STRING' | 'NUMBER' | 'INTEGER' | 'BOOLEAN' | 'ARRAY' | 'OBJECT';
+  readonly enum?: readonly string[];
+  readonly nullable?: boolean;
+  readonly items?: GeminiSchemaProperty;
+  readonly properties?: Readonly<Record<string, GeminiSchemaProperty>>;
+  readonly required?: readonly string[];
+}
+
+export interface AiQueryOptions {
+  readonly maxOutputTokens?: number;
+  readonly geminiResponseSchema?: GeminiSchemaProperty;
+}
+
+export class ScreeningJsonParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ScreeningJsonParseError';
+  }
+}
+
 async function runGeminiProvider(
   config: AiConfig,
   prompt: string,
   systemPrompt: string | undefined,
   taskTier: AiTaskTier,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  options?: AiQueryOptions
 ): Promise<string | null> {
   const cleanKey = cleanApiKey(config.geminiApiKey);
   if (!cleanKey) {
@@ -730,7 +752,9 @@ async function runGeminiProvider(
         ],
         generationConfig: {
           temperature: 0.1,
-          responseMimeType: 'application/json'
+          responseMimeType: 'application/json',
+          ...(options?.maxOutputTokens ? { maxOutputTokens: options.maxOutputTokens } : {}),
+          ...(options?.geminiResponseSchema ? { responseSchema: options.geminiResponseSchema } : {})
         }
       }),
       signal: combineAbortSignals(timeoutMs, abortSignal)
@@ -1019,7 +1043,8 @@ export async function queryAiModel(
   prompt: string,
   systemPrompt?: string,
   taskTier: AiTaskTier = 'reasoning',
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  options?: AiQueryOptions
 ): Promise<string | null> {
   if (abortSignal?.aborted) {
     throw createAbortError();
@@ -1046,7 +1071,7 @@ export async function queryAiModel(
 
     try {
       if (activeProvider === 'gemini') {
-        return await runGeminiProvider(effectiveConfig, prompt, systemPrompt, taskTier, abortSignal);
+        return await runGeminiProvider(effectiveConfig, prompt, systemPrompt, taskTier, abortSignal, options);
       }
       if (activeProvider === 'openai') {
         return await runOpenAiProvider(effectiveConfig, prompt, systemPrompt, taskTier, abortSignal);
@@ -1969,6 +1994,126 @@ export function formatPrismaExclusionReason(rawCategory?: string, rawReason?: st
   return PRISMA_EXCLUSION_LABELS_FR[resolvePrismaExclusionCategory(rawCategory, rawReason)];
 }
 
+export const SCREENING_GEMINI_RESPONSE_SCHEMA: GeminiSchemaProperty = {
+  type: 'ARRAY',
+  items: {
+    type: 'OBJECT',
+    properties: {
+      pmid: { type: 'STRING' },
+      status: { type: 'STRING', enum: ['included', 'maybe', 'excluded'] },
+      exclusionCategory: {
+        type: 'STRING',
+        enum: [...PRISMA_EXCLUSION_CATEGORY_KEYS],
+        nullable: true
+      },
+      evidenceSnippet: { type: 'STRING' }
+    },
+    required: ['pmid', 'status', 'evidenceSnippet']
+  }
+};
+
+/**
+ * Parseur JSON défensif dédié au pré-dépouillement par lot :
+ * - retire les éventuels blocs Markdown (```json / ```) et caractères de contrôle non échappés ;
+ * - isole la sous-chaîne entre le premier `[` et le dernier `]` (avec repli objet wrapper / tableau tronqué) ;
+ * - valide strictement chaque entrée (`pmid` non vide et `status` parmi included | maybe | excluded).
+ */
+export function parseScreeningResponse(rawResponse: string): BatchScreenItemResult[] {
+  if (!rawResponse || !rawResponse.trim()) {
+    return [];
+  }
+
+  // 1. Nettoyage défensif : blocs Markdown et caractères de contrôle non échappés
+  const withoutFences = rawResponse
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '');
+  let cleaned = '';
+  for (let idx = 0; idx < withoutFences.length; idx++) {
+    const code = withoutFences.charCodeAt(idx);
+    const isUnsafeControl = (code < 32 && code !== 9 && code !== 10 && code !== 13) || code === 127;
+    cleaned += isUnsafeControl ? ' ' : withoutFences[idx];
+  }
+  cleaned = cleaned.trim();
+
+  let parsed: unknown = null;
+
+  // 2. Extraction prioritaire de la sous-chaîne entre le premier `[` et le dernier `]`
+  const firstBracket = cleaned.indexOf('[');
+  const lastBracket = cleaned.lastIndexOf(']');
+  if (firstBracket !== -1 && lastBracket > firstBracket) {
+    const arraySlice = cleaned.slice(firstBracket, lastBracket + 1);
+    try {
+      parsed = JSON.parse(arraySlice);
+    } catch {
+      // Si un retour à la ligne brut subsiste dans une chaîne, le remplacer par un espace
+      try {
+        parsed = JSON.parse(arraySlice.replace(/\r?\n/g, ' '));
+      } catch {
+        parsed = null;
+      }
+    }
+  }
+
+  // 3. Repli sur le parseur générique (gère les wrappers objets OpenAI {"results": [...]} et tableaux tronqués)
+  if (parsed === null) {
+    cleaned = cleaned.replace(/\r?\n/g, ' ');
+    parsed = extractJsonFromLlmResponse<unknown>(cleaned);
+  }
+
+  let rawItems: Array<Record<string, unknown>> = [];
+  if (Array.isArray(parsed)) {
+    rawItems = parsed as Array<Record<string, unknown>>;
+  } else if (parsed && typeof parsed === 'object') {
+    const obj = parsed as Record<string, unknown>;
+    const candidateArray =
+      obj.results ?? obj.articles ?? obj.evaluations ?? obj.decisions ?? obj.items ?? obj.data;
+    if (Array.isArray(candidateArray)) {
+      rawItems = candidateArray as Array<Record<string, unknown>>;
+    } else if ('pmid' in obj && 'status' in obj) {
+      rawItems = [obj];
+    }
+  }
+
+  const validItems: BatchScreenItemResult[] = [];
+  for (const item of rawItems) {
+    if (!item || typeof item !== 'object') continue;
+    const rawPmid = String(item.pmid ?? '').trim();
+    const normalizedPmid = rawPmid.replace(/\D+/g, '') || rawPmid;
+    const normalizedStatus = String(item.status ?? '').toLowerCase().trim();
+    if (
+      !normalizedPmid ||
+      (normalizedStatus !== 'included' && normalizedStatus !== 'maybe' && normalizedStatus !== 'excluded')
+    ) {
+      continue;
+    }
+
+    const rawCat = typeof item.exclusionCategory === 'string' ? item.exclusionCategory.trim() : undefined;
+    const rawReason = typeof item.exclusionReason === 'string' ? item.exclusionReason.trim() : undefined;
+    const exclusionCategory =
+      normalizedStatus === 'excluded'
+        ? resolvePrismaExclusionCategory(rawCat, rawReason)
+        : undefined;
+    const snippetClean =
+      typeof item.evidenceSnippet === 'string'
+        ? item.evidenceSnippet.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim()
+        : undefined;
+
+    validItems.push({
+      pmid: normalizedPmid,
+      status: normalizedStatus,
+      exclusionCategory,
+      exclusionReason:
+        normalizedStatus === 'excluded' && exclusionCategory
+          ? PRISMA_EXCLUSION_LABELS_FR[exclusionCategory]
+          : undefined,
+      evidenceSnippet: snippetClean || undefined
+    });
+  }
+
+  return validItems;
+}
+
 export interface BatchScreenItemResult {
   pmid: string;
   status: 'included' | 'maybe' | 'excluded';
@@ -2097,66 +2242,28 @@ Réponds STRICTEMENT par un tableau JSON valide contenant exactement un objet po
   }
 ]`;
 
-  const system = "Tu es un évaluateur clinique strict pour une revue systématique médicale. Réponds exclusivement en JSON valide sous la forme d'un tableau d'objets.";
-  const rawResponse = await queryAiModel(prompt, system, 'batch', abortSignal);
+  const system =
+    "Tu es un évaluateur clinique strict pour une revue systématique médicale. Réponds exclusivement en JSON valide sous la forme d'un tableau d'objets. Rédige chaque evidenceSnippet en une seule ligne courte, sans retour à la ligne et sans guillemets doubles à l'intérieur du texte.";
+  const rawResponse = await queryAiModel(prompt, system, 'batch', abortSignal, {
+    maxOutputTokens: 8192,
+    geminiResponseSchema: SCREENING_GEMINI_RESPONSE_SCHEMA
+  });
   if (abortSignal?.aborted) {
     throw createAbortError();
   }
   if (!rawResponse || !rawResponse.trim()) {
-    throw new Error("Le modèle IA a renvoyé une réponse vide lors du dépouillement.");
+    throw new ScreeningJsonParseError("Le modèle IA a renvoyé une réponse vide lors du dépouillement.");
   }
 
-  const parsed = extractJsonFromLlmResponse<unknown>(rawResponse);
-  let rawItems: Array<Record<string, unknown>> = [];
-  if (Array.isArray(parsed)) {
-    rawItems = parsed as Array<Record<string, unknown>>;
-  } else if (parsed && typeof parsed === 'object') {
-    const obj = parsed as Record<string, unknown>;
-    const candidateArray =
-      obj.results ?? obj.articles ?? obj.evaluations ?? obj.decisions ?? obj.items ?? obj.data;
-    if (Array.isArray(candidateArray)) {
-      rawItems = candidateArray as Array<Record<string, unknown>>;
-    } else if ('pmid' in obj && 'status' in obj) {
-      rawItems = [obj];
+  const validFresh = parseScreeningResponse(rawResponse);
+  if (validFresh.length > 0) {
+    for (const cleanItem of validFresh) {
+      screeningDecisionCache.set(`${cleanItem.pmid}::${picoFp}`, cleanItem);
     }
+    return [...cachedResults, ...validFresh];
   }
 
-  if (rawItems.length > 0) {
-    const validFresh: BatchScreenItemResult[] = [];
-    for (const item of rawItems) {
-      const rawPmid = String(item?.pmid || '').trim();
-      const normalizedPmid = rawPmid.replace(/\D+/g, '') || rawPmid;
-      const normalizedStatus = String(item?.status || '').toLowerCase().trim();
-      if (
-        normalizedPmid &&
-        (normalizedStatus === 'included' || normalizedStatus === 'maybe' || normalizedStatus === 'excluded')
-      ) {
-        const rawCat = typeof item.exclusionCategory === 'string' ? item.exclusionCategory.trim() : undefined;
-        const rawReason = typeof item.exclusionReason === 'string' ? item.exclusionReason.trim() : undefined;
-        const exclusionCategory =
-          normalizedStatus === 'excluded'
-            ? resolvePrismaExclusionCategory(rawCat, rawReason)
-            : undefined;
-        const cleanItem: BatchScreenItemResult = {
-          pmid: normalizedPmid,
-          status: normalizedStatus,
-          exclusionCategory,
-          exclusionReason:
-            normalizedStatus === 'excluded' && exclusionCategory
-              ? PRISMA_EXCLUSION_LABELS_FR[exclusionCategory]
-              : undefined,
-          evidenceSnippet: typeof item.evidenceSnippet === 'string' ? item.evidenceSnippet.trim() : undefined
-        };
-        validFresh.push(cleanItem);
-        screeningDecisionCache.set(`${normalizedPmid}::${picoFp}`, cleanItem);
-      }
-    }
-    if (validFresh.length > 0) {
-      return [...cachedResults, ...validFresh];
-    }
-  }
-
-  throw new Error("La réponse du modèle IA n'a pas pu être interprétée comme un JSON de dépouillement valide.");
+  throw new ScreeningJsonParseError("La réponse du modèle IA n'a pas pu être interprétée comme un JSON de dépouillement valide.");
 }
 
 export interface AuditRefinementResult {
@@ -2240,9 +2347,12 @@ Règles méthodologiques PRISMA / Cochrane impératives :
    - "conceptFr" : terme médical français court (1 à 4 mots maximum, sans phrase narrative ni posologie) adapté à HeTOP.
    - "conceptEn" : concept biomédical anglais canonique (sans balises [Mesh]/[tiab] ni opérateurs booléens) adapté à NCBI Entrez.
    - "synonymsTiab" : 1 à 5 synonymes ou abréviations anglaises utiles en texte libre [tiab].
-2. Axes I (Intervention/Exposition) et C (Comparateur) : extrais UNIQUEMENT la substance active, le produit biologique, le dispositif ou la procédure spécifique. N'émets JAMAIS un concept séparé pour une simple voie d'administration ou un terme générique (ex. pas de "Injections, Intra-Articular", "Oral Administration", "Therapeutics", "Treatment", "Therapy" ou "Pharmaceutical Preparations") qui polluerait le bloc OR.
-3. Axe O (Outcome) : sépare chaque critère de jugement distinct en un concept atomique dédié (ex. douleur vs fonction articulaire).
-4. Ne mets jamais de balises techniques ([Mesh], [tiab], *) ni d'opérateurs AND/OR dans les chaînes.
+2. Axe P (Population / Pathologie cible) — Règles Cochrane / PRESS :
+   - Lorsqu'une pathologie ou condition clinique est présente dans P, n'émets AUCUN critère démographique générique ni check tag non discriminant (population adulte générale, humains, âge moyen) : ils relèvent du dépouillement, et l'exclusion animale est déjà gérée par le filtre Cochrane.
+   - Comme tous les concepts retournés dans un même axe P sont reliés par OR dans l'équation, si une sous-population clinique spécifique est mentionnée (ex. pédiatrie, gériatrie, grossesse), ne l'émets JAMAIS comme concept séparé dans le même groupe OR que la pathologie (ce qui détruirait la spécificité de la recherche) : n'émets que la pathologie ou condition clinique cible dans P et reporte ce critère d'âge ou de sous-population au dépouillement.
+3. Axes I (Intervention/Exposition) et C (Comparateur) : extrais UNIQUEMENT la substance active, le produit biologique, le dispositif ou la procédure spécifique. N'émets JAMAIS un concept séparé pour une simple voie d'administration ou un terme générique (ex. pas de "Injections, Intra-Articular", "Oral Administration", "Therapeutics", "Treatment", "Therapy" ou "Pharmaceutical Preparations") qui polluerait le bloc OR.
+4. Axe O (Outcome) : sépare chaque critère de jugement distinct en un concept atomique dédié (ex. douleur vs fonction articulaire).
+5. Ne mets jamais de balises techniques ([Mesh], [tiab], *) ni d'opérateurs AND/OR dans les chaînes.
 Réponds EXCLUSIVEMENT en JSON valide.`;
 
   const prompt = `Normalise les axes PICO/PECO suivants au format JSON strict :

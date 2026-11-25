@@ -1,12 +1,13 @@
+import { loadEnv } from 'vite';
 import { configDefaults, defineConfig } from 'vitest/config';
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   test: {
-    include: ['tests/eval/clinical-eval.ts'],
+    include: ['tests/eval/clinical-vignettes.eval.ts'],
     exclude: [...configDefaults.exclude, 'backups/**'],
+    env: loadEnv(mode || 'development', process.cwd(), ''),
     fileParallelism: false,
-    testTimeout: 120000,
+    testTimeout: 60000,
     hookTimeout: 60000,
   },
-});
-
+}));

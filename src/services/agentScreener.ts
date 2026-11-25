@@ -9,9 +9,11 @@ import {
   aiScreenBatchArticles,
   BatchScreenItemResult,
   PRISMA_EXCLUSION_LABELS_FR,
+  ScreeningJsonParseError,
   formatPrismaExclusionReason,
   getAiConfig,
-  getActiveProviderLabel
+  getActiveProviderLabel,
+  mapErrorToUserMessage
 } from './localAiService';
 
 export interface ScreenedArticle {
@@ -37,6 +39,8 @@ export interface ScreeningReport {
   totalMaybe?: number;
   totalExcluded: number;
   totalPending?: number;
+  failedPendingCount?: number;
+  lastErrorMessage?: string;
   exclusionBreakdown: Array<{ reason: string; count: number; pmids: string[] }>;
   screenedArticles: ScreenedArticle[];
 }
@@ -109,7 +113,7 @@ export async function runAgentScreeningDeep(
   const total = articles.length;
   const config = getAiConfig();
   const isFreeTier = config.rateLimitMode === 'free_tier';
-  const BATCH_SIZE = isFreeTier ? 12 : 20;
+  const BATCH_SIZE = 12;
   const CONCURRENCY = isFreeTier ? 1 : 2;
   const providerLabel = getActiveProviderLabel(config, 'batch');
   const evaluatedBy: 'gemini' | 'openai' | 'anthropic' =
@@ -117,150 +121,239 @@ export async function runAgentScreeningDeep(
 
   const isCancelled = (): boolean => Boolean(abortSignal?.aborted || (shouldCancel && shouldCancel()));
 
-  const batches: Array<{ startIdx: number; items: readonly RawPubMedArticleInput[] }> = [];
+  interface IndexedArticle {
+    readonly slotIndex: number;
+    readonly article: RawPubMedArticleInput;
+  }
+
+  const batches: Array<{ startIdx: number; items: readonly IndexedArticle[] }> = [];
   for (let i = 0; i < total; i += BATCH_SIZE) {
-    batches.push({ startIdx: i, items: articles.slice(i, i + BATCH_SIZE) });
+    const slice = articles.slice(i, i + BATCH_SIZE).map((article, offset) => ({
+      slotIndex: i + offset,
+      article
+    }));
+    batches.push({ startIdx: i, items: slice });
   }
 
   const screenedSlots: Array<ScreenedArticle | undefined> = new Array(total);
   let completedCount = 0;
+  let failedPendingCount = 0;
+  let lastErrorMessage: string | undefined;
 
-  const markBatchPending = (startIdx: number, batch: readonly RawPubMedArticleInput[]) => {
-    for (let k = 0; k < batch.length; k++) {
-      const art = batch[k];
-      const pmid = String(art.pmid || '');
-      screenedSlots[startIdx + k] = {
-        pmid,
-        doi: art.doi || undefined,
-        title: art.title || '',
-        authors: art.authors || '',
-        source: art.source || '',
-        pubDate: art.pubDate || '',
-        abstract: art.abstract || '',
-        meshHeadings: Array.isArray(art.meshHeadings) ? [...art.meshHeadings] : [],
-        publicationTypes: Array.isArray(art.publicationTypes) ? [...art.publicationTypes] : [],
-        status: 'pending',
-        url: art.url || `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`
-      };
+  const buildPendingArticle = (art: RawPubMedArticleInput): ScreenedArticle => {
+    const pmid = String(art.pmid || '');
+    return {
+      pmid,
+      doi: art.doi || undefined,
+      title: art.title || '',
+      authors: art.authors || '',
+      source: art.source || '',
+      pubDate: art.pubDate || '',
+      abstract: art.abstract || '',
+      meshHeadings: Array.isArray(art.meshHeadings) ? [...art.meshHeadings] : [],
+      publicationTypes: Array.isArray(art.publicationTypes) ? [...art.publicationTypes] : [],
+      status: 'pending',
+      url: art.url || `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`
+    };
+  };
+
+  const markItemsPending = (items: readonly IndexedArticle[], countAsFailure = false) => {
+    for (const entry of items) {
+      if (!screenedSlots[entry.slotIndex]) {
+        screenedSlots[entry.slotIndex] = buildPendingArticle(entry.article);
+        if (countAsFailure) {
+          failedPendingCount++;
+        }
+      }
     }
   };
 
-  const processBatch = async (batchEntry: { startIdx: number; items: readonly RawPubMedArticleInput[] }) => {
-    const { startIdx, items: batch } = batchEntry;
-    const batchStart = startIdx + 1;
-    const batchEnd = Math.min(startIdx + batch.length, total);
+  const commitScreenedArticle = (slotIndex: number, screened: ScreenedArticle) => {
+    screenedSlots[slotIndex] = screened;
+    completedCount++;
+    onArticleScreened?.(screened, completedCount, total);
+  };
 
+  /**
+   * Traite un sous-lot d'articles ayant un résumé avec :
+   * 1. 1 tentative automatique supplémentaire en cas d'échec de parsing JSON ;
+   * 2. Bisection en 2 moitiés si l'échec persiste et que le sous-lot compte > 2 notices ;
+   * 3. Sauvegarde immédiate au fil de l'eau de chaque notice valide via `onArticleScreened`.
+   */
+  const screenAbstractSubBatch = async (
+    itemsWithAbstract: readonly IndexedArticle[],
+    allowBisection: boolean
+  ): Promise<void> => {
+    if (itemsWithAbstract.length === 0) return;
     if (isCancelled()) {
-      markBatchPending(startIdx, batch);
+      markItemsPending(itemsWithAbstract, false);
       return;
     }
 
-    onProgress?.(completedCount + 1, total, `Analyse du lot (${batchStart} à ${batchEnd} / ${total}) par ${providerLabel}...`);
-
-    // Séparer les articles avec résumé (évaluables par IA) et sans résumé (retenus d'office en 'maybe' selon Cochrane)
-    const articlesWithAbstract = batch
-      .filter(a => !hasMissingOrEmptyAbstract(a.abstract))
-      .map(a => ({
-        pmid: String(a.pmid || ''),
-        title: a.title || '',
-        abstract: a.abstract || '',
-        meshHeadings: a.meshHeadings ? [...a.meshHeadings] : []
+    const toPayload = (list: readonly IndexedArticle[]) =>
+      list.map(({ article }) => ({
+        pmid: String(article.pmid || ''),
+        title: article.title || '',
+        abstract: article.abstract || '',
+        meshHeadings: article.meshHeadings ? [...article.meshHeadings] : []
       }));
 
     let evaluatedBatch: BatchScreenItemResult[] = [];
+    let lastErr: unknown = null;
+    let isParseFailure = false;
 
-    if (articlesWithAbstract.length > 0) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (isCancelled()) {
+        markItemsPending(itemsWithAbstract, false);
+        return;
+      }
       try {
-        evaluatedBatch = await aiScreenBatchArticles(articlesWithAbstract, pico, abortSignal);
+        evaluatedBatch = await aiScreenBatchArticles(toPayload(itemsWithAbstract), pico, abortSignal);
+        lastErr = null;
+        isParseFailure = false;
+        break;
       } catch (err: unknown) {
         if (isCancelled() || (err instanceof DOMException && err.name === 'AbortError')) {
-          markBatchPending(startIdx, batch);
+          markItemsPending(itemsWithAbstract, false);
           return;
         }
-        throw err;
+        lastErr = err;
+        isParseFailure = err instanceof ScreeningJsonParseError;
+        // Seul un échec de parsing JSON déclenche la 2e tentative automatique ; les erreurs auth/réseau/quota sortent immédiatement
+        if (!isParseFailure) {
+          break;
+        }
       }
     }
 
-    if (articlesWithAbstract.length > 0 && evaluatedBatch.length === 0 && isCancelled()) {
-      markBatchPending(startIdx, batch);
+    if (lastErr !== null) {
+      if (isParseFailure && allowBisection && itemsWithAbstract.length > 2 && !isCancelled()) {
+        const mid = Math.ceil(itemsWithAbstract.length / 2);
+        await screenAbstractSubBatch(itemsWithAbstract.slice(0, mid), false);
+        await screenAbstractSubBatch(itemsWithAbstract.slice(mid), false);
+        return;
+      }
+      lastErrorMessage = mapErrorToUserMessage(lastErr);
+      markItemsPending(itemsWithAbstract, true);
       return;
     }
 
     const evalMap = new Map<string, BatchScreenItemResult>();
-    evaluatedBatch.forEach(e => {
+    for (const e of evaluatedBatch) {
       if (e.pmid) {
         const rawKey = String(e.pmid).trim();
         const digitsKey = rawKey.replace(/\D+/g, '');
         evalMap.set(rawKey, e);
         if (digitsKey) evalMap.set(digitsKey, e);
       }
-    });
+    }
 
-    for (let k = 0; k < batch.length; k++) {
-      const art = batch[k];
-      const pmid = String(art.pmid || '');
-      const missingAbs = hasMissingOrEmptyAbstract(art.abstract);
+    const missingEntries: IndexedArticle[] = [];
+    for (const entry of itemsWithAbstract) {
+      const { slotIndex, article } = entry;
+      const pmid = String(article.pmid || '');
       const aiRes = evalMap.get(pmid);
+      if (!aiRes) {
+        missingEntries.push(entry);
+        continue;
+      }
 
-      let status: ScreenedArticle['status'] = 'maybe';
-      let exclusionReason: string | undefined = undefined;
-      let evidenceSnippet = 'À vérifier sur texte intégral.';
-
-      if (missingAbs) {
-        status = 'maybe';
-        evidenceSnippet = "Résumé absent dans PubMed : retenu par précaution pour vérification sur texte intégral (directive Cochrane / PRISMA 2020).";
-      } else if (aiRes) {
-        status = aiRes.status;
-        exclusionReason =
+      const screened: ScreenedArticle = {
+        pmid,
+        doi: article.doi || undefined,
+        title: article.title || '',
+        authors: article.authors || '',
+        source: article.source || '',
+        pubDate: article.pubDate || '',
+        abstract: article.abstract || '',
+        meshHeadings: article.meshHeadings ? [...article.meshHeadings] : [],
+        publicationTypes: article.publicationTypes ? [...article.publicationTypes] : [],
+        status: aiRes.status,
+        exclusionReason:
           aiRes.status === 'excluded'
             ? formatPrismaExclusionReason(aiRes.exclusionCategory, aiRes.exclusionReason)
-            : undefined;
-        evidenceSnippet =
+            : undefined,
+        evidenceSnippet:
           aiRes.evidenceSnippet ||
           (aiRes.status === 'included'
             ? 'Conforme aux critères PICO'
             : aiRes.status === 'maybe'
               ? 'Information partielle au résumé : à vérifier sur texte intégral.'
-              : PRISMA_EXCLUSION_LABELS_FR.other);
-      } else {
-        throw new Error(
-          `Dépouillement IA incomplet sur le lot ${batchStart}-${batchEnd} : la notice PMID ${pmid} est absente de la réponse du modèle.`
-        );
-      }
-
-      const screened: ScreenedArticle = {
-        pmid,
-        doi: art.doi || undefined,
-        title: art.title || '',
-        authors: art.authors || '',
-        source: art.source || '',
-        pubDate: art.pubDate || '',
-        abstract: art.abstract || '',
-        meshHeadings: art.meshHeadings ? [...art.meshHeadings] : [],
-        publicationTypes: art.publicationTypes ? [...art.publicationTypes] : [],
-        status,
-        exclusionReason,
-        evidenceSnippet,
-        url: art.url || `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
+              : PRISMA_EXCLUSION_LABELS_FR.other),
+        url: article.url || `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
         evaluatedBy
       };
-
-      screenedSlots[startIdx + k] = screened;
-      completedCount++;
-      onArticleScreened?.(screened, completedCount, total);
+      commitScreenedArticle(slotIndex, screened);
     }
+
+    // Si le modèle a omis quelques PMIDs dans un lot par ailleurs valide, tenter une passe réduite sur les manquants
+    if (missingEntries.length > 0 && !isCancelled()) {
+      if (allowBisection && missingEntries.length < itemsWithAbstract.length) {
+        await screenAbstractSubBatch(missingEntries, false);
+      } else if (allowBisection && missingEntries.length > 2) {
+        const mid = Math.ceil(missingEntries.length / 2);
+        await screenAbstractSubBatch(missingEntries.slice(0, mid), false);
+        await screenAbstractSubBatch(missingEntries.slice(mid), false);
+      } else {
+        lastErrorMessage = `Réponse IA incomplète : ${missingEntries.length} notice(s) omise(s) dans le sous-lot.`;
+        markItemsPending(missingEntries, true);
+      }
+    }
+  };
+
+  const processBatch = async (batchEntry: { startIdx: number; items: readonly IndexedArticle[] }) => {
+    const { startIdx, items: batch } = batchEntry;
+    const batchStart = startIdx + 1;
+    const batchEnd = Math.min(startIdx + batch.length, total);
+
+    if (isCancelled()) {
+      markItemsPending(batch, false);
+      return;
+    }
+
+    onProgress?.(completedCount + 1, total, `Analyse du lot (${batchStart} à ${batchEnd} / ${total}) par ${providerLabel}...`);
+
+    // 1. Les articles sans résumé sont immédiatement retenus en 'maybe' selon Cochrane (sans appel IA)
+    const itemsWithAbstract: IndexedArticle[] = [];
+    for (const entry of batch) {
+      const { slotIndex, article } = entry;
+      if (hasMissingOrEmptyAbstract(article.abstract)) {
+        const pmid = String(article.pmid || '');
+        commitScreenedArticle(slotIndex, {
+          pmid,
+          doi: article.doi || undefined,
+          title: article.title || '',
+          authors: article.authors || '',
+          source: article.source || '',
+          pubDate: article.pubDate || '',
+          abstract: article.abstract || '',
+          meshHeadings: article.meshHeadings ? [...article.meshHeadings] : [],
+          publicationTypes: article.publicationTypes ? [...article.publicationTypes] : [],
+          status: 'maybe',
+          evidenceSnippet:
+            "Résumé absent dans PubMed : retenu par précaution pour vérification sur texte intégral (directive Cochrane / PRISMA 2020).",
+          url: article.url || `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
+          evaluatedBy
+        });
+      } else {
+        itemsWithAbstract.push(entry);
+      }
+    }
+
+    // 2. Traitement résilient du sous-lot avec retry + bisection
+    await screenAbstractSubBatch(itemsWithAbstract, true);
   };
 
   for (let b = 0; b < batches.length; b += CONCURRENCY) {
     if (isCancelled()) {
       for (let rem = b; rem < batches.length; rem++) {
-        await processBatch(batches[rem]);
+        markItemsPending(batches[rem].items, false);
       }
       break;
     }
 
     const wave = batches.slice(b, b + CONCURRENCY);
-    await Promise.all(wave.map(batchEntry => processBatch(batchEntry)));
+    await Promise.allSettled(wave.map(batchEntry => processBatch(batchEntry)));
 
     // Régulation douce uniquement si l'utilisateur est resté en quota gratuit (15 req/min)
     if (isFreeTier && (b + CONCURRENCY < batches.length) && !isCancelled()) {
@@ -274,7 +367,19 @@ export async function runAgentScreeningDeep(
   }
 
   const screenedArticles = screenedSlots.filter((item): item is ScreenedArticle => Boolean(item));
-  return computeScreeningMetrics(screenedArticles);
+  const metrics = computeScreeningMetrics(screenedArticles);
+
+  // Si aucune notice n'a pu être évaluée et qu'une erreur a laissé des notices en attente, propager l'erreur explicite
+  if (failedPendingCount > 0 && metrics.totalScreened === 0 && !isCancelled()) {
+    throw new Error(
+      `${lastErrorMessage || "Erreur lors du dépouillement IA."} (${failedPendingCount} notice(s) restée(s) en attente).`
+    );
+  }
+
+  return {
+    ...metrics,
+    ...(failedPendingCount > 0 ? { failedPendingCount, lastErrorMessage } : {})
+  };
 }
 
 /**

@@ -941,6 +941,103 @@ describe('1. Tests Unitaires & Conformité Constitutionnelle (gemini.md)', () =>
       expect(cochraneQuery).toContain(':ti,ab,kw');
     });
 
+    it('ne doit générer aucun AND () orphelin lorsque le comparateur C est vide', () => {
+      const blocks: MappedBlock[] = [
+        {
+          picoType: 'P',
+          originalText: 'Lombalgie chronique',
+          descriptor: 'Low Back Pain',
+          meshId: 'D017116',
+          descriptors: [{ descriptor: 'Low Back Pain', meshId: 'D017116', noExp: false, isMajor: false }],
+          entryTerms: ['low back pain', 'chronic low back pain'],
+          truncationTerms: []
+        },
+        {
+          picoType: 'I',
+          originalText: 'Éducation thérapeutique du patient',
+          descriptor: 'Patient Education as Topic',
+          meshId: 'D010353',
+          descriptors: [{ descriptor: 'Patient Education as Topic', meshId: 'D010353', noExp: false, isMajor: false }],
+          entryTerms: ['patient education'],
+          truncationTerms: []
+        },
+        {
+          picoType: 'C',
+          originalText: '',
+          descriptor: '',
+          meshId: '',
+          descriptors: [],
+          entryTerms: [],
+          truncationTerms: []
+        }
+      ];
+
+      const { pubmedQuery, embaseQuery, cochraneQuery } = buildQuerySyntax(blocks, {
+        strategy: 'balanced',
+        useTruncation: true,
+        filters: ['humans_cochrane']
+      });
+
+      for (const q of [pubmedQuery, embaseQuery, cochraneQuery]) {
+        expect(q).not.toMatch(/\bAND\s*\(\s*\)/i);
+        expect(q).not.toMatch(/\(\s*\)\s*AND\b/i);
+        expect(q).not.toMatch(/^\s*(?:AND|OR)\b|\b(?:AND|OR)\s*$/i);
+        expect((q.match(/\(/g) || []).length).toBe((q.match(/\)/g) || []).length);
+        expect((q.match(/"/g) || []).length % 2).toBe(0);
+      }
+    });
+
+    it('doit assembler un bloc NOT utilisateur avec le filtre Cochrane NOT ("Animals"[Mesh] NOT "Humans"[Mesh]) en gardant des parenthèses équilibrées', () => {
+      const blocks: MappedBlock[] = [
+        {
+          picoType: 'P',
+          originalText: 'Asthme',
+          descriptor: 'Asthma',
+          meshId: 'D001249',
+          descriptors: [{ descriptor: 'Asthma', meshId: 'D001249', noExp: false, isMajor: false }],
+          entryTerms: ['asthma'],
+          truncationTerms: []
+        },
+        {
+          picoType: 'I',
+          originalText: 'Corticoïdes inhalés',
+          descriptor: 'Budesonide',
+          meshId: 'D019819',
+          descriptors: [{ descriptor: 'Budesonide', meshId: 'D019819', noExp: false, isMajor: false }],
+          entryTerms: ['budesonide', 'inhaled corticosteroids'],
+          truncationTerms: []
+        },
+        {
+          picoType: 'NOT',
+          originalText: 'Bronchopneumopathie chronique obstructive',
+          descriptor: 'Pulmonary Disease, Chronic Obstructive',
+          meshId: 'D029424',
+          descriptors: [
+            { descriptor: 'Pulmonary Disease, Chronic Obstructive', meshId: 'D029424', noExp: false, isMajor: false }
+          ],
+          entryTerms: ['copd'],
+          truncationTerms: []
+        }
+      ];
+
+      const { pubmedQuery, embaseQuery, cochraneQuery } = buildQuerySyntax(blocks, {
+        strategy: 'balanced',
+        useTruncation: true,
+        filters: ['humans_cochrane']
+      });
+
+      expect(pubmedQuery).toContain('NOT\n(');
+      expect(pubmedQuery).toContain('"Pulmonary Disease, Chronic Obstructive"[Mesh]');
+      expect(pubmedQuery).toContain('NOT ("Animals"[Mesh] NOT "Humans"[Mesh])');
+
+      for (const q of [pubmedQuery, embaseQuery, cochraneQuery]) {
+        expect((q.match(/\(/g) || []).length).toBe((q.match(/\)/g) || []).length);
+        expect((q.match(/"/g) || []).length % 2).toBe(0);
+        expect(q).not.toMatch(/\[[^\]]+\]\[[^\]]+\]/);
+        expect(q).not.toContain('""');
+      }
+    });
+
     it('doit émettre la forme canonique NLM (prevention and control) pour PubMed tout en conservant /PC sur CENTRAL', () => {
       const compiled = compileAxisBlockRust({
         axisRole: 'population',
