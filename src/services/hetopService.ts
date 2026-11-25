@@ -16,6 +16,22 @@ export function resetHetopCircuitBreaker(): void {
   hetopTermCache.clear();
 }
 
+interface HetopConceptRaw {
+  readonly terminology?: string;
+  readonly code?: string;
+  readonly conceptType?: string;
+  readonly cismefId?: string;
+  readonly preferredLabelEn?: string;
+  readonly englishLabel?: string;
+  readonly preferredLabel?: string;
+  readonly synonyms?: readonly string[];
+}
+
+interface HetopSearchResponse {
+  readonly totalResults?: number | string;
+  readonly concepts?: readonly HetopConceptRaw[];
+}
+
 export interface HetopCredentials {
   username: string;
   password: string;
@@ -76,13 +92,14 @@ export async function testHetopConnection(user?: string, pass?: string): Promise
       return { success: false, message: `Réponse serveur HeTOP : HTTP ${res.status}` };
     }
 
-    const data = await res.json();
+    const data = (await res.json()) as HetopSearchResponse;
     return { 
       success: true, 
       message: `Connexion réussie au serveur CISMeF HeTOP (${data?.totalResults || 'Concepts'} indexés).` 
     };
-  } catch (err: any) {
-    return { success: false, message: `Erreur de connexion : ${err.message || 'Serveur injoignable'}` };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Serveur injoignable';
+    return { success: false, message: `Erreur de connexion : ${message}` };
   }
 }
 
@@ -130,7 +147,7 @@ export async function searchHetopMesh(term: string): Promise<MeshDetails | null>
       }
       return null;
     }
-    const data = await res.json();
+    const data = (await res.json()) as HetopSearchResponse;
 
     if (!data || !data.concepts || !Array.isArray(data.concepts) || data.concepts.length === 0) {
       hetopTermCache.set(cacheKey, null);
@@ -138,7 +155,7 @@ export async function searchHetopMesh(term: string): Promise<MeshDetails | null>
     }
 
     // Recherche en priorité d'un concept MeSH avec code Dxxxxx
-    const meshConcept = data.concepts.find((c: any) => 
+    const meshConcept = data.concepts.find((c: HetopConceptRaw) => 
       c.terminology === 'MeSH' || 
       (c.code && /^D\d+/.test(c.code)) ||
       (c.conceptType && c.conceptType.includes('MESH'))

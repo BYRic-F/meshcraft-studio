@@ -16,12 +16,11 @@ import { generatePrismaReportText, generatePrismaSummaryData } from '../../src/s
 import { parsePubMedEfetchXml, selectStratifiedPmids, queryPubMedLive } from '../../src/services/pubmedApi';
 import {
   sanitizePicoConcept,
-  stripClinicalNarrativeFraming,
+  aiNormalizePicoConcepts,
   inferStudyDesignFromText,
   computeCochraneOverallRating,
   computeBackoffDelayMs,
   mapErrorToUserMessage,
-  evaluateArticleRoB2Deterministic,
   selectUnassessedRobBatch,
   aiEvaluateBatchRoB2,
   stripIatrogenicTermsFromOutcome,
@@ -33,11 +32,13 @@ import {
   getAiConfig,
   saveAiConfig,
   testAiConnectionLive,
-  canUnlockPrerequisitesModal
+  canUnlockPrerequisitesModal,
+  resolvePrismaExclusionCategory,
+  formatPrismaExclusionReason,
+  PRISMA_EXCLUSION_LABELS_FR
 } from '../../src/services/localAiService';
 import {
-  extractSubConcepts,
-  extractParenthesizedTerms,
+  clearMeshResolutionCaches,
   isNlmPharmacologicalSubstance,
   searchNcbiMesh,
   extractTreeNumbersFromEntrezItem,
@@ -95,86 +96,355 @@ describe('1. Tests Unitaires & Conformité Constitutionnelle (gemini.md)', () =>
       expect(clean).toContain('(Myocardial Infarction)');
       expect(clean).toContain('(Acute Coronary Syndrome)');
       expect(clean.toLowerCase()).not.toContain('prévention secondaire');
-
-      // Et extractSubConcepts ne doit extraire que les 2 descripteurs anglais sans dédoubler les clauses françaises
-      const subConcepts = extractSubConcepts(clean);
-      expect(subConcepts).toEqual(['Myocardial Infarction', 'Acute Coronary Syndrome']);
     });
 
-    it('doit isoler les concepts médicaux purs même sans parenthèses anglaises et ignorer les posologies', () => {
-      const frenchNarrative = 'Patients en prévention secondaire après un infarctus du myocarde ou un syndrome coronarien aigu';
-      const subs = extractSubConcepts(frenchNarrative);
-      expect(subs).toEqual(['infarctus du myocarde', 'syndrome coronarien aigu']);
+    it('doit autoriser les branches NLM biologiques/cellulaires (A15, A11) sur les axes I et C sans ouvrir aux branches hors-sujet', () => {
+      expect(isValidTreeNumberForAxis(['A15.145.693'], 'I')).toBe(true);
+      expect(isValidTreeNumberForAxis(['A11.872'], 'C')).toBe(true);
+      expect(isValidTreeNumberForAxis(['L01.462'], 'I')).toBe(false);
+    });
 
-      const dosageText = 'Traitement par colchicine à faible dose (0,5 mg/j)';
-      expect(extractParenthesizedTerms(dosageText)).toEqual([]);
-      expect(stripClinicalNarrativeFraming(dosageText).toLowerCase()).toBe('colchicine');
+    it('doit normaliser les axes via aiNormalizePicoConcepts en concepts atomiques { conceptFr, conceptEn, synonymsTiab }', async () => {
+      const store = new Map<string, string>();
+      vi.stubGlobal('localStorage', {
+        get length() { return store.size; },
+        clear() { store.clear(); },
+        getItem(k: string) { return store.get(k) ?? null; },
+        key(i: number) { return Array.from(store.keys())[i] ?? null; },
+        removeItem(k: string) { store.delete(k); },
+        setItem(k: string, v: string) { store.set(k, v); }
+      });
 
-      const pharmaClass = 'Inhibiteurs du SGLT2 (Empagliflozine, Dapagliflozine)';
-      const pharmaSubs = extractSubConcepts(pharmaClass);
-      expect(pharmaSubs).toContain('Empagliflozine');
-      expect(pharmaSubs).toContain('Dapagliflozine');
-      expect(pharmaSubs).toContain('Inhibiteurs du SGLT2');
+      saveAiConfig({ provider: 'openai', routingMode: 'smart', openaiApiKey: 'sk-test-norm-key' });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () =>
+          new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      i: [
+                        {
+                          conceptFr: 'plasma riche en plaquettes',
+                          conceptEn: 'Platelet-Rich Plasma',
+                          synonymsTiab: ['platelet-rich plasma', 'PRP']
+                        }
+                      ],
+                      o: [
+                        { conceptFr: 'douleur', conceptEn: 'Pain', synonymsTiab: ['pain', 'VAS'] },
+                        { conceptFr: 'fonction articulaire', conceptEn: 'Joint Function', synonymsTiab: ['WOMAC', 'joint function'] }
+                      ]
+                    })
+                  }
+                }
+              ]
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          )
+        )
+      );
+
+      try {
+        const normalized = await aiNormalizePicoConcepts([
+          { key: 'i', text: 'Injections intra-articulaires de plasma riche en plaquettes' },
+          { key: 'o', text: 'Douleur et fonction articulaire' }
+        ]);
+        expect(normalized.i).toHaveLength(1);
+        expect(normalized.i?.[0].conceptFr).toBe('plasma riche en plaquettes');
+        expect(normalized.i?.[0].conceptEn).toBe('Platelet-Rich Plasma');
+        expect(normalized.i?.[0].synonymsTiab).toContain('PRP');
+        expect(normalized.o).toHaveLength(2);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('doit résoudre chaque concept atomique via HeTOP puis NCBI Entrez sans arrêt prématuré et basculer en Concept-Libre si non indexé', async () => {
+      clearMeshResolutionCaches();
+      const store = new Map<string, string>();
+      store.set('meshcraft_hetop_creds', JSON.stringify({ username: 'doc', password: 'secret' }));
+      vi.stubGlobal('localStorage', {
+        get length() { return store.size; },
+        clear() { store.clear(); },
+        getItem(k: string) { return store.get(k) ?? null; },
+        key(i: number) { return Array.from(store.keys())[i] ?? null; },
+        removeItem(k: string) { store.delete(k); },
+        setItem(k: string, v: string) { store.set(k, v); }
+      });
+
+      const calledUrls: string[] = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          calledUrls.push(url);
+          if (url.includes('/api/hetop/searchConcepts/')) {
+            if (url.includes('plasma')) {
+              return new Response(
+                JSON.stringify({
+                  concepts: [{ terminology: 'MeSH', code: 'D053657', preferredLabelEn: 'Platelet-Rich Plasma' }]
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+              );
+            }
+            return new Response(JSON.stringify({ concepts: [] }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' }
+            });
+          }
+          if (url.includes('esearch.fcgi')) {
+            if (url.includes('D053657')) {
+              return new Response(JSON.stringify({ esearchresult: { idlist: ['53657'] } }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+              });
+            }
+            return new Response(JSON.stringify({ esearchresult: { idlist: [] } }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' }
+            });
+          }
+          if (url.includes('esummary.fcgi')) {
+            return new Response(
+              JSON.stringify({
+                result: {
+                  '53657': {
+                    uid: '53657',
+                    ds_recordtype: 'descriptor',
+                    ds_meshui: 'D053657',
+                    ds_meshterms: ['Platelet-Rich Plasma', 'Plasma, Platelet-Rich'],
+                    ds_subheading: ['therapeutic use'],
+                    ds_treenum: ['A15.145.693']
+                  }
+                }
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+          }
+          return new Response('{}', { status: 404 });
+        })
+      );
+
+      try {
+        // 1. HeTOP prioritaire (D053657) -> enrichissement NCBI (A15.145.693 accepté sur I)
+        const prpMesh = await searchNcbiMesh('Injections intra-articulaires de plasma riche en plaquettes', 'I', undefined, [
+          {
+            conceptFr: 'plasma riche en plaquettes',
+            conceptEn: 'Platelet-Rich Plasma',
+            synonymsTiab: ['platelet-rich plasma', 'PRP']
+          }
+        ]);
+        expect(prpMesh).not.toBeNull();
+        expect(prpMesh?.meshId).toBe('D053657');
+        expect(prpMesh?.descriptor).toBe('Platelet-Rich Plasma');
+        expect(prpMesh?.entryTerms).toContain('prp');
+        expect(calledUrls.some((u) => u.includes('/api/hetop/searchConcepts/'))).toBe(true);
+
+        // 2. Concept non indexé sur axe O -> jamais null, bascule proprement en Concept-Libre [TiAb]
+        const freeOutcome = await searchNcbiMesh('Score fonctionnel WOMAC', 'O', undefined, [
+          {
+            conceptFr: 'score WOMAC',
+            conceptEn: 'WOMAC functional score',
+            synonymsTiab: ['WOMAC', 'joint function']
+          }
+        ]);
+        expect(freeOutcome).not.toBeNull();
+        expect(freeOutcome?.meshId).toBe('Concept-Libre');
+        expect(freeOutcome?.entryTerms).toContain('womac');
+      } finally {
+        clearMeshResolutionCaches();
+        vi.unstubAllGlobals();
+      }
     });
   });
 
   describe('Extraction NLP du Résumé Clinique (parseClinicalAbstractNLP)', () => {
-    it('doit extraire correctement les 4 axes PICO à partir d\'un texte brut', async () => {
-      const text = `
-        Les patients obèses adultes ont un risque accru de morbi-mortalité.
-        Nous avons évalué le traitement par inhibiteur SGLT2 chez ces sujets.
-        Le groupe contrôle recevait un placebo ou une prise en charge standard.
-        Le critère de jugement principal était la mortalité globale et la survie.
-      `;
-      const pico = await parseClinicalAbstractNLP(text);
-      expect(pico.p.toLowerCase()).toContain('patient');
-      expect(pico.i.toLowerCase().includes('traitement') || pico.i.toLowerCase().includes('sglt2')).toBe(true);
-      expect(pico.c.toLowerCase()).toContain('placebo');
-      expect(pico.o.toLowerCase()).toContain('mortalit');
+    const createMemoryStorage = (): Storage => {
+      const store = new Map<string, string>();
+      return {
+        get length() { return store.size; },
+        clear() { store.clear(); },
+        getItem(key: string) { return store.has(key) ? (store.get(key) ?? null) : null; },
+        key(index: number) { return Array.from(store.keys())[index] ?? null; },
+        removeItem(key: string) { store.delete(key); },
+        setItem(key: string, value: string) { store.set(key, String(value)); }
+      };
+    };
+
+    const sleepApneaQuestion =
+      "Chez les adultes atteints d'apnée obstructive du sommeil, quel est l'effet des orthèses d'avancée mandibulaire comparées à la pression positive continue (PPC) sur la pression artérielle et l'indice d'apnées-hypopnées ?";
+
+    it('doit lever une erreur explicite si le texte est vide ou si aucune clé API IA n\'est configurée', async () => {
+      vi.stubGlobal('localStorage', createMemoryStorage());
+      try {
+        await expect(parseClinicalAbstractNLP('')).rejects.toThrow(/saisir une question clinique/i);
+
+        saveAiConfig({ provider: 'openai', geminiApiKey: '', openaiApiKey: '', anthropicApiKey: '' });
+        await expect(parseClinicalAbstractNLP(sleepApneaQuestion)).rejects.toThrow(/clé API IA/i);
+
+        saveAiConfig({ provider: 'gemini', geminiApiKey: '', openaiApiKey: '', anthropicApiKey: '' });
+        await expect(parseClinicalAbstractNLP(sleepApneaQuestion)).rejects.toThrow(/clé API IA/i);
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
 
-    it('doit extraire précisément les sections PRISMA structurées', async () => {
-      const structuredText = `
-        Population: Adultes présentant une maladie rénale chronique et un diabète
-        Intervention: Empagliflozine 10 mg par jour
-        Contrôle: Placebo avec soins standard
-        Critères de jugement: Déclin du débit de filtration glomérulaire et mortalité
-        Exclusion: Patients sous dialyse péritonéale ou transplantation
-      `;
-      const pico = await parseClinicalAbstractNLP(structuredText);
-      expect(pico.p.toLowerCase()).toContain('maladie r');
-      expect(pico.i.toLowerCase()).toContain('empagliflozine');
-      expect(pico.c.toLowerCase()).toContain('placebo');
-      expect(pico.o.toLowerCase()).toContain('mortalit');
-      expect(pico.not?.toLowerCase()).toContain('dialyse');
-    });
-
-    it('doit renvoyer des champs vides pour une chaîne vide', async () => {
-      const pico = await parseClinicalAbstractNLP('');
-      expect(pico.p).toBe('');
-      expect(pico.i).toBe('');
-    });
-
-    it('doit structurer la question narrative brute de la thèse (Bayen 2026) en séparant I et O et en désactivant P et C non restrictifs', async () => {
-      const rawThesisQuestion =
-        "Le syndrome parkinsonien médicamenteux peut conduire à une erreur diagnostique, à une cascade de prescriptions et à une perte fonctionnelle. La revue vise à produire une synthèse utile au médecin généraliste, centrée sur les médicaments encore commercialisés en France, en distinguant estimation du risque, signal de pharmacovigilance et observation clinique. Chez l’adulte, quels médicaments actuellement commercialisés en France et utilisés en soins primaires sont associés à la survenue d’un syndrome parkinsonien, avec quelle ampleur du risque et quel niveau de certitude des preuves publiées entre le 29 octobre 2006 et le 28 octobre 2026 ?";
-
-      const extracted = await parseClinicalAbstractNLP(rawThesisQuestion);
-      expect(extracted.p).toBe('Adultes en soins primaires');
-      expect(extracted.i).toContain('Pharmacovigilance');
-      expect(extracted.o.toLowerCase()).toContain('syndrome parkinsonien');
-      expect(extracted.o.toLowerCase()).not.toContain('pharmacovigilance');
-      expect(extracted.qualifications?.p?.axisRole).toBe('demographic_unrestricted');
-      expect(extracted.qualifications?.c?.axisRole).toBe('passive_comparator');
-      expect(extracted.qualifications?.o?.axisRole).toBe('induced_syndrome');
-      expect(extracted.qualifications?.o?.impliedSubheadings).toContain('chemically induced');
-      expect(extracted.qualifications?.recommendedActivePico).toEqual({
-        p: false,
-        i: true,
-        c: false,
-        o: true,
-        not: false
+    it('doit extraire une structure JSON PICO complète via le modèle rapide sur une question clinique libre', async () => {
+      vi.stubGlobal('localStorage', createMemoryStorage());
+      saveAiConfig({
+        provider: 'gemini',
+        routingMode: 'smart',
+        geminiApiKey: 'AIzaSyTestKey1234567890'
       });
+
+      const calledUrls: string[] = [];
+      const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calledUrls.push(url);
+        if (url.includes('/v1beta/models?')) {
+          return new Response(JSON.stringify({ models: [] }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        approach: 'pico',
+                        p: "Adultes atteints d'apnée obstructive du sommeil",
+                        i: "Orthèses d'avancée mandibulaire",
+                        c: 'Pression positive continue',
+                        o: "Pression artérielle, Indice d'apnées-hypopnées",
+                        not: '',
+                        qualifications: {
+                          p: {
+                            axisRole: 'clinical_condition',
+                            impliedSubheadings: [],
+                            coreClinicalConcept: 'Apnée obstructive du sommeil',
+                            englishCoreTerms: ['Sleep Apnea, Obstructive']
+                          },
+                          i: {
+                            axisRole: 'clinical_condition',
+                            impliedSubheadings: [],
+                            coreClinicalConcept: "Orthèse d'avancée mandibulaire",
+                            englishCoreTerms: ['Mandibular Advancement', 'Orthotic Devices']
+                          },
+                          c: {
+                            axisRole: 'clinical_condition',
+                            impliedSubheadings: [],
+                            coreClinicalConcept: 'Pression positive continue',
+                            englishCoreTerms: ['Continuous Positive Airway Pressure']
+                          },
+                          o: {
+                            axisRole: 'clinical_condition',
+                            impliedSubheadings: [],
+                            coreClinicalConcept: 'Pression artérielle',
+                            englishCoreTerms: ['Blood Pressure', 'Apnea-Hypopnea Index']
+                          },
+                          not: {
+                            axisRole: 'clinical_condition',
+                            impliedSubheadings: [],
+                            coreClinicalConcept: '',
+                            englishCoreTerms: []
+                          },
+                          recommendedActivePico: { p: true, i: true, c: true, o: true, not: false }
+                        },
+                        confidence: 96,
+                        reasoning: 'Question interventionnelle comparant deux thérapeutiques actives (PICO).'
+                      })
+                    }
+                  ]
+                }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      try {
+        const extracted = await parseClinicalAbstractNLP(sleepApneaQuestion);
+        expect(extracted.approach).toBe('pico');
+        expect(extracted.source).toBe('gemini');
+        expect(extracted.modelUsed).toBe('gemini-flash-latest');
+        expect(extracted.p.toLowerCase()).toContain('apnée obstructive du sommeil');
+        expect(extracted.i.toLowerCase()).toContain('orthèses');
+        expect(extracted.c.toLowerCase()).toContain('pression positive continue');
+        expect(extracted.o.toLowerCase()).toContain('pression artérielle');
+        expect(extracted.qualifications?.recommendedActivePico?.c).toBe(true);
+        expect(calledUrls.some((u) => u.includes('gemini-flash-latest:generateContent'))).toBe(true);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('doit propager explicitement une erreur API (HTTP 401 ou 503) sans jamais basculer sur un repli par règles', async () => {
+      vi.stubGlobal('localStorage', createMemoryStorage());
+      saveAiConfig({
+        provider: 'openai',
+        routingMode: 'smart',
+        openaiApiKey: 'sk-test-invalid-key-1234567890',
+        geminiApiKey: '',
+        anthropicApiKey: ''
+      });
+
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => {
+          return new Response(JSON.stringify({ error: { message: 'Incorrect API key provided' } }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        })
+      );
+
+      try {
+        await expect(parseClinicalAbstractNLP(sleepApneaQuestion)).rejects.toThrow(/Clé API Cloud manquante ou invalide/i);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('doit envoyer response_format json_object sur OpenAI et rejeter un JSON invalide sans repli silencieux', async () => {
+      vi.stubGlobal('localStorage', createMemoryStorage());
+      saveAiConfig({
+        provider: 'openai',
+        routingMode: 'smart',
+        openaiApiKey: 'sk-test-valid-key-1234567890',
+        geminiApiKey: '',
+        anthropicApiKey: ''
+      });
+
+      let capturedBody = '';
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+          capturedBody = typeof init?.body === 'string' ? init.body : '';
+          return new Response(
+            JSON.stringify({
+              choices: [{ message: { content: 'Texte libre non structuré sans accolades' } }]
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        })
+      );
+
+      try {
+        await expect(parseClinicalAbstractNLP(sleepApneaQuestion)).rejects.toThrow(/JSON PICO\/PECO valide/i);
+        const payload = JSON.parse(capturedBody) as { model?: string; response_format?: { type?: string } };
+        expect(payload.model).toBe('gpt-4o-mini');
+        expect(payload.response_format?.type).toBe('json_object');
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
   });
 
@@ -488,6 +758,36 @@ describe('1. Tests Unitaires & Conformité Constitutionnelle (gemini.md)', () =>
       expect(report).toContain('823');
       expect(report).toContain('9');
       expect(report).toContain('FLUX DE SÉLECTION DÉTAILLÉ');
+      expect(report).toContain('PubMed / MEDLINE (National Library of Medicine) et Embase (Elsevier) ont été interrogées');
+    });
+
+    it('ne doit mentionner que PubMed / MEDLINE comme base interrogée lorsque Embase et Cochrane sont à 0', () => {
+      const report = generatePrismaReportText(
+        '("Osteoarthritis, Knee"[Mesh]) AND ("Platelet-Rich Plasma"[Mesh])',
+        {
+          identifiedTotal: 180,
+          pubmedCount: 180,
+          embaseCount: 0,
+          duplicatesRemoved: 0,
+          screened: 180,
+          excludedScreening: 120,
+          fullTextAssessed: 60,
+          excludedFullText: 0,
+          includedFinal: 40
+        }
+      );
+
+      expect(report).toContain('La base de données PubMed / MEDLINE (National Library of Medicine) a été interrogée.');
+      expect(report).toContain('Les équations traduites pour Embase (Elsevier) et Cochrane CENTRAL sont fournies ci-dessous');
+      expect(report).not.toContain('Embase (Elsevier) et la Cochrane Library ont été interrogées');
+    });
+
+    it('doit normaliser et agréger proprement les motifs d\'exclusion PRISMA dans les 7 catégories standardisées', () => {
+      expect(resolvePrismaExclusionCategory('study_design')).toBe('study_design');
+      expect(resolvePrismaExclusionCategory('preclinical')).toBe('preclinical');
+      expect(resolvePrismaExclusionCategory(undefined, 'Modèle animal murin')).toBe('preclinical');
+      expect(formatPrismaExclusionReason('comparator')).toBe(PRISMA_EXCLUSION_LABELS_FR.comparator);
+      expect(formatPrismaExclusionReason('outcome')).toBe(PRISMA_EXCLUSION_LABELS_FR.outcome);
     });
   });
 
@@ -504,19 +804,75 @@ describe('1. Tests Unitaires & Conformité Constitutionnelle (gemini.md)', () =>
       expect(inferStudyDesignFromText('Intermittent fasting and weight loss: a systematic review and meta-analysis')).toBe('review');
     });
 
-    it('doit évaluer les 5 domaines RoB 2 sans laisser aucune cellule non évaluée', () => {
-      const rob = evaluateArticleRoB2Deterministic({
-        pmid: '42413768',
-        title: 'Time-restricted eating, liver health, and fecal microbiota in adults with overweight or obesity: A randomized controlled trial.',
-        abstract: 'Double-blind randomized trial registered at NCT04567890 with intention-to-treat analysis of body weight and liver markers.'
+    it('doit évaluer les 5 domaines RoB 2 via le LLM et propager une erreur explicite si le lot est incomplet ou échoue', async () => {
+      const store = new Map<string, string>();
+      vi.stubGlobal('localStorage', {
+        get length() { return store.size; },
+        clear() { store.clear(); },
+        getItem(k: string) { return store.get(k) ?? null; },
+        key(i: number) { return Array.from(store.keys())[i] ?? null; },
+        removeItem(k: string) { store.delete(k); },
+        setItem(k: string, v: string) { store.set(k, v); }
       });
-      expect(rob.pmid).toBe('42413768');
-      expect(rob.studyDesign).toBe('rct');
-      expect(rob.d2).toBe('low');
-      expect(rob.d3).toBe('low');
-      expect(rob.d4).toBe('low');
-      expect(rob.d5).toBe('low');
-      expect(['low', 'moderate', 'high']).toContain(rob.overall);
+
+      saveAiConfig({
+        provider: 'openai',
+        routingMode: 'smart',
+        openaiApiKey: 'sk-test-rob2-key'
+      });
+
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () =>
+          new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify([
+                      {
+                        pmid: '42413768',
+                        studyDesign: 'rct',
+                        d1: 'moderate',
+                        d2: 'low',
+                        d3: 'low',
+                        d4: 'low',
+                        d5: 'low',
+                        justification: 'Essai en double insu avec analyse ITT et enregistrement NCT.'
+                      }
+                    ])
+                  }
+                }
+              ]
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          )
+        )
+      );
+
+      try {
+        const res = await aiEvaluateBatchRoB2([
+          {
+            pmid: '42413768',
+            title: 'Time-restricted eating in adults: A randomized controlled trial.',
+            abstract: 'Double-blind randomized trial registered at NCT04567890 with intention-to-treat analysis.'
+          }
+        ]);
+        const rob = res.get('42413768');
+        expect(rob).toBeDefined();
+        expect(rob?.studyDesign).toBe('rct');
+        expect(rob?.overall).toBe('moderate');
+
+        // Réponse incomplète (2 études envoyées, 1 seule retournée) -> doit lever une erreur explicite (zéro repli heuristique)
+        await expect(
+          aiEvaluateBatchRoB2([
+            { pmid: '42413768', title: 'Study 1', abstract: 'Abstract 1' },
+            { pmid: '42413769', title: 'Study 2', abstract: 'Abstract 2' }
+          ])
+        ).rejects.toThrow(/incomplète/i);
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
   });
 
@@ -932,6 +1288,7 @@ describe('1. Tests Unitaires & Conformité Constitutionnelle (gemini.md)', () =>
       // 1. Google Gemini Smart Routing (alias -latest pérennes & FinOps minimal-thinking sur batch)
       const geminiConf = { ...baseConf, provider: 'gemini' as const, routingMode: 'smart' as const };
       expect(resolveActiveModelForTask(geminiConf, 'reasoning')).toBe('gemini-pro-latest');
+      expect(resolveActiveModelForTask(geminiConf, 'fast')).toBe('gemini-flash-latest');
       expect(resolveActiveModelForTask(geminiConf, 'batch')).toBe('gemini-flash-lite-latest');
 
       // 2. OpenAI Smart Routing (GPT-4o + GPT-4o-mini)
@@ -982,24 +1339,53 @@ describe('1. Tests Unitaires & Conformité Constitutionnelle (gemini.md)', () =>
       expect(fp1).toBe(fp2);
     });
 
-    it('doit terminer proprement runAgentScreeningDeep sans boucle infinie si le LLM renvoie une réponse vide', async () => {
-      const report = await runAgentScreeningDeep(
-        [
-          {
-            pmid: '99001122',
-            title: 'Sample clinical trial',
-            authors: 'Doe J',
-            source: 'Lancet',
-            pubDate: '2025',
-            abstract: 'A randomized trial with sufficient abstract length for batch screening evaluation.',
-            meshHeadings: ['Humans']
-          }
-        ],
-        { p: 'Adultes', i: 'Halopéridol', c: '', o: 'Syndrome parkinsonien' }
+    it('doit propager une erreur explicite dans runAgentScreeningDeep sans boucle infinie ni faux positif si le LLM renvoie une réponse vide', async () => {
+      const store = new Map<string, string>();
+      vi.stubGlobal('localStorage', {
+        get length() { return store.size; },
+        clear() { store.clear(); },
+        getItem(k: string) { return store.get(k) ?? null; },
+        key(i: number) { return Array.from(store.keys())[i] ?? null; },
+        removeItem(k: string) { store.delete(k); },
+        setItem(k: string, v: string) { store.set(k, v); }
+      });
+
+      saveAiConfig({
+        provider: 'openai',
+        routingMode: 'smart',
+        openaiApiKey: 'sk-test-empty-screening'
+      });
+
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () =>
+          new Response(JSON.stringify({ choices: [{ message: { content: '' } }] }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          })
+        )
       );
-      expect(report.totalScreened).toBe(1);
-      expect(report.totalMaybe).toBe(1);
-      expect(report.screenedArticles[0].status).toBe('maybe');
+
+      try {
+        await expect(
+          runAgentScreeningDeep(
+            [
+              {
+                pmid: '99001122',
+                title: 'Sample clinical trial',
+                authors: 'Doe J',
+                source: 'Lancet',
+                pubDate: '2025',
+                abstract: 'A randomized trial with sufficient abstract length for batch screening evaluation.',
+                meshHeadings: ['Humans']
+              }
+            ],
+            { p: 'Adultes', i: 'Halopéridol', c: '', o: 'Syndrome parkinsonien' }
+          )
+        ).rejects.toThrow(/réponse vide/i);
+      } finally {
+        vi.unstubAllGlobals();
+      }
     }, 15000);
   });
 

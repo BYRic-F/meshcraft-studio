@@ -17,12 +17,16 @@ import {
 } from './rustEngineService';
 import {
   aiExtractClinicalPico,
+  aiNormalizePicoConcepts,
   aiAuditAndCritiqueQuery,
   PreviousAuditContext,
   ClinicalPicoExtractionResult,
   PicoSemanticQualifications,
+  NormalizedPicoConceptsMap,
   getAiConfig,
+  cleanApiKey,
   getActiveProviderLabel,
+  mapErrorToUserMessage,
   sanitizePicoConcept,
   inferDeterministicAxisQualification,
   stripIatrogenicTermsFromOutcome
@@ -87,263 +91,25 @@ export interface MappedBlock {
   isPharmacologicalSubstance?: boolean;
 }
 
-/**
- * Nettoie les syntagmes extraits en éliminant les scories verbales introductives
- * sans toucher aux entités biomédicales.
- */
-export function cleanClinicalClause(text: string): string {
-  if (!text) return '';
-  let s = text.trim();
-  s = s.replace(/^[\s,;:\-–—.]+|[\s,;:\-–—.]+$/g, '');
-
-  const noisePrefixes = [
-    /^(?:nous avons (?:évalué|analysé|étudié|comparé|testé)|l'objectif (?:de cette étude|de ce travail|principal)? était (?:d'évaluer|de comparer|d'analyser|de déterminer)|cette étude (?:prospective|rétrospective|randomisée)? (?:évalue|analyse|compare)|il s'agit d'une? étude (?:prospective|rétrospective|randomisée)? (?:visant à|évaluant)|le but de cette étude était de)\s+/i,
-    /^(?:we evaluated|the purpose of this study was to|this (?:randomized|prospective|retrospective)? study (?:aimed to|evaluated|investigated)|our objective was to)\s+/i,
-    /^(?:évaluation de|évaluation d'|analyse de|analyse d'|étude de|étude d'|impact de|impact d'|effet de|effet d')\s+/i
-  ];
-
-  for (const pat of noisePrefixes) {
-    s = s.replace(pat, '');
-  }
-
-  return s.trim();
-}
-
-export function parseExplicitStructuredSections(rawText: string): ClinicalPicoExtractionResult | null {
-  if (!rawText || !rawText.trim()) return null;
-
-  let p = '';
-  let i = '';
-  let c = '';
-  let o = '';
-  let not = '';
-  let matchedCount = 0;
-
-  const lines = rawText.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    const pMatch = trimmed.match(/^(?:population|patients?(?:\s+et\s+m[ée]thodes)?|participants?|inclusion|cohorte|participants?\s+and\s+methods|subjects?)\s*[:\-–—]\s*(.+)$/i);
-    if (pMatch && !p) {
-      p = cleanClinicalClause(pMatch[1]);
-      matchedCount++;
-      continue;
-    }
-
-    const iMatch = trimmed.match(/^(?:intervention|traitement|treatment|exposure|proc[ée]dure|experimental\s+group|bras\s+actif)\s*[:\-–—]\s*(.+)$/i);
-    if (iMatch && !i) {
-      i = cleanClinicalClause(iMatch[1]);
-      matchedCount++;
-      continue;
-    }
-
-    const cMatch = trimmed.match(/^(?:comparat(?:eur|or)|contr[ôo]le|control(?:\s+group)?|placebo|r[ée]f[ée]rence|groupe\s+t[ée]moin|comparaison)\s*[:\-–—]\s*(.+)$/i);
-    if (cMatch && !c) {
-      c = cleanClinicalClause(cMatch[1]);
-      matchedCount++;
-      continue;
-    }
-
-    const oMatch = trimmed.match(/^(?:crit[èe]res?\s+(?:de\s+jugement|princip(?:al|aux))|outcomes?|endpoints?|r[ée]sultats?\s+mesur[ée]s?|mesures?|primary\s+endpoint)\s*[:\-–—]\s*(.+)$/i);
-    if (oMatch && !o) {
-      o = stripIatrogenicTermsFromOutcome(cleanClinicalClause(oMatch[1]));
-      matchedCount++;
-      continue;
-    }
-
-    const notMatch = trimmed.match(/^(?:crit[èe]res?\s+d['’]exclusion|exclusions?|non\s+inclus?|exclusion\s+criteria)\s*[:\-–—]\s*(.+)$/i);
-    if (notMatch && !not) {
-      not = cleanClinicalClause(notMatch[1]);
-      matchedCount++;
-      continue;
-    }
-  }
-
-  if (matchedCount >= 2 && (p || i)) {
-    const pQual = inferDeterministicAxisQualification('P', p);
-    const iQual = inferDeterministicAxisQualification('I', i);
-    const cQual = inferDeterministicAxisQualification('C', c);
-    const oQual = inferDeterministicAxisQualification('O', o);
-    const notQual = inferDeterministicAxisQualification('NOT', not);
-
-    return {
-      p,
-      i,
-      c,
-      o,
-      not,
-      source: 'rules',
-      confidence: 95,
-      reasoning: 'Extraction structurée exacte basée sur les en-têtes explicites du texte.',
-      qualifications: {
-        p: pQual,
-        i: iQual,
-        c: cQual,
-        o: oQual,
-        not: notQual,
-        recommendedActivePico: {
-          p: pQual.axisRole !== 'demographic_unrestricted' && Boolean(p),
-          i: Boolean(i),
-          c: cQual.axisRole !== 'passive_comparator' && Boolean(c),
-          o: Boolean(o),
-          not: Boolean(not)
-        }
-      }
-    };
-  }
-
-  return null;
-}
-
-function parseClinicalDiscourseFallback(rawText: string): ClinicalPicoExtractionResult | null {
-  // 1. Détection grammaticale d'une question étiologique / pharmacovigilance interrogative
-  // Ex: "Chez l’adulte, quels médicaments ... sont associés à la survenue d’un <phénotype>, avec quelle ampleur..."
-  const etiologicQuestionMatch = rawText.match(
-    /chez\s+(?:l['’]|les?\s+)([^,]+),\s*quels?\s+m[ée]dicaments?([^?]*?)\bsont\s+associ[ée]s?\s+[àa]\s+la\s+survenue\s+d['’](?:un[e]?\s+|des?\s+)?([^,?]+)/i
-  );
-  if (etiologicQuestionMatch) {
-    const rawPop = etiologicQuestionMatch[1].trim();
-    const rawContext = etiologicQuestionMatch[2].trim();
-    const rawOutcome = stripIatrogenicTermsFromOutcome(etiologicQuestionMatch[3].trim());
-
-    const p = /\bsoins?\s+primaires?\b/i.test(rawContext)
-      ? 'Adultes en soins primaires'
-      : cleanClinicalClause(rawPop);
-    const i = 'Effets indésirables médicamenteux, Pharmacovigilance';
-    const c = "Absence d'exposition";
-    const o = /\binduit|\bm[ée]dicamenteux/i.test(rawOutcome)
-      ? rawOutcome
-      : `${rawOutcome} secondaire induit chimiquement`;
-
-    const pQual = inferDeterministicAxisQualification('P', p);
-    const iQual = inferDeterministicAxisQualification('I', i);
-    const cQual = inferDeterministicAxisQualification('C', c);
-    const oQual = inferDeterministicAxisQualification('O', o);
-    const notQual = inferDeterministicAxisQualification('NOT', '');
-
-    return {
-      p,
-      i,
-      c,
-      o,
-      not: '',
-      source: 'rules',
-      confidence: 96,
-      reasoning:
-        "Question étiologique/pharmacovigilance ouverte (PECO Voie 2) : séparation stricte entre l'exposition médicamenteuse générique (I) et le phénotype induit chimiquement (O), avec désactivation documentaire de la démographie (P) et du comparateur passif (C).",
-      qualifications: {
-        p: pQual,
-        i: iQual,
-        c: cQual,
-        o: oQual,
-        not: notQual,
-        recommendedActivePico: {
-          p: pQual.axisRole !== 'demographic_unrestricted',
-          i: true,
-          c: cQual.axisRole !== 'passive_comparator',
-          o: true,
-          not: false
-        }
-      }
-    };
-  }
-
-  const sentences = rawText
-    .replace(/\r\n/g, '\n')
-    .split(/(?<=[.!?])\s+|\n+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 5);
-
-  let p = '';
-  let i = '';
-  let c = '';
-  let o = '';
-  let not = '';
-
-  for (const s of sentences) {
-    if (!not && /\b(?:exclus(?:ion)?|non[\s-]inclus|contre[\s-]indiqu)\b/i.test(s)) {
-      not = cleanClinicalClause(s);
-      continue;
-    }
-    if (!o && /\b(?:crit[èe]res?\s+de\s+jugement|primary\s+endpoint|outcomes?|mortalit[ée]|survie|efficacité\s+sur)\b/i.test(s)) {
-      o = stripIatrogenicTermsFromOutcome(cleanClinicalClause(s));
-      continue;
-    }
-    if (!c && /\b(?:groupe\s+contr[ôo]le|placebo|comparateur|prise\s+en\s+charge\s+standard|soins?\s+usuels?|soins?\s+standards?)\b/i.test(s)) {
-      c = cleanClinicalClause(s);
-      continue;
-    }
-    if (!i && /\b(?:[ée]valu[ée]|traitement\s+par|intervention|administr[ée]|recevaient|th[ée]rapie\s+par)\b/i.test(s)) {
-      i = cleanClinicalClause(s);
-      continue;
-    }
-    if (!p && /\b(?:patients?|adultes?|sujets?|enfants?|population|atteints?\s+de|souffrant\s+de|ob[èe]ses?)\b/i.test(s)) {
-      p = cleanClinicalClause(s);
-      continue;
-    }
-  }
-
-  if (p || i) {
-    const pQual = inferDeterministicAxisQualification('P', p);
-    const iQual = inferDeterministicAxisQualification('I', i);
-    const cQual = inferDeterministicAxisQualification('C', c);
-    const oQual = inferDeterministicAxisQualification('O', o);
-    const notQual = inferDeterministicAxisQualification('NOT', not);
-
-    return {
-      p,
-      i,
-      c,
-      o,
-      not,
-      source: 'rules',
-      confidence: 80,
-      reasoning: 'Extraction discursive par segmentation grammaticale des phrases cliniques.',
-      qualifications: {
-        p: pQual,
-        i: iQual,
-        c: cQual,
-        o: oQual,
-        not: notQual,
-        recommendedActivePico: {
-          p: pQual.axisRole !== 'demographic_unrestricted' && Boolean(p),
-          i: Boolean(i),
-          c: cQual.axisRole !== 'passive_comparator' && Boolean(c),
-          o: Boolean(o),
-          not: Boolean(not)
-        }
-      }
-    };
-  }
-  return null;
-}
-
 export async function parseClinicalAbstractNLP(rawText: string): Promise<ClinicalPicoExtractionResult> {
-  if (!rawText || rawText.trim() === '') {
-    return { p: '', i: '', c: '', o: '', not: '', source: 'rules', confidence: 0, reasoning: 'Texte vide' };
+  const trimmed = (rawText || '').trim();
+  if (!trimmed) {
+    throw new Error("Veuillez saisir une question clinique ou un résumé avant de lancer l'extraction IA.");
   }
 
-  const explicitResult = parseExplicitStructuredSections(rawText);
-  if (explicitResult) {
-    return explicitResult;
+  const config = getAiConfig();
+  const hasActiveKey =
+    (config.provider === 'gemini' && Boolean(cleanApiKey(config.geminiApiKey))) ||
+    (config.provider === 'openai' && Boolean(cleanApiKey(config.openaiApiKey))) ||
+    (config.provider === 'anthropic' && Boolean(cleanApiKey(config.anthropicApiKey)));
+
+  if (!hasActiveKey) {
+    throw new Error(
+      "Une clé API IA (Google Gemini, OpenAI ou Anthropic) est requise pour la structuration automatique. Ouvrez les Paramètres pour configurer votre clé."
+    );
   }
 
-  try {
-    const aiExtracted = await aiExtractClinicalPico(rawText);
-    if (aiExtracted && (aiExtracted.p || aiExtracted.i)) {
-      return aiExtracted;
-    }
-  } catch {}
-
-  const discourseFallback = parseClinicalDiscourseFallback(rawText);
-  if (discourseFallback) {
-    return discourseFallback;
-  }
-
-  throw new Error(
-    "L'extraction par IA n'a pas pu identifier les axes PICO dans ce texte. Vérifiez votre clé API Cloud (Google Gemini, OpenAI ou Anthropic) dans les Paramètres."
-  );
+  return await aiExtractClinicalPico(trimmed);
 }
 
 const VALID_RUST_AXIS_ROLES = new Set<PicoAxisRoleRust>([
@@ -553,7 +319,33 @@ export async function runMultiAgentPipeline(
     `${filteredConcepts.length} axe(s) structuré(s) (dont ${filteredConcepts.filter((c) => c.type === 'NOT').length} exclusion).`
   );
 
-  onStepProgress?.(2, 'running', 'Résolution dynamique MeSH officielle & qualification NLM (ds_subheading)...');
+  onStepProgress?.(2, 'running', 'Normalisation des concepts biomédicaux & vérification officielle HeTOP / NCBI MeSH...');
+
+  // Normalisation LLM en concepts atomiques { conceptFr, conceptEn, synonymsTiab } pour tout axe sans concepts déjà normalisés
+  const axesNeedingNormalization: Array<{ readonly key: 'p' | 'i' | 'c' | 'o' | 'not'; readonly text: string }> = [];
+  for (const item of filteredConcepts) {
+    const qualification = inferDeterministicAxisQualification(item.type, item.text);
+    if (
+      qualification.axisRole === 'passive_comparator' ||
+      (qualification.axisRole === 'demographic_unrestricted' && hasSpecificClinicalAxis)
+    ) {
+      continue;
+    }
+    const axisKey = item.type.toLowerCase() as 'p' | 'i' | 'c' | 'o' | 'not';
+    const existingAtomics = settings.qualifications?.[axisKey]?.atomicConcepts;
+    if (!existingAtomics || existingAtomics.length === 0) {
+      const queryTarget =
+        item.type === 'O' && qualification.coreClinicalConcept
+          ? qualification.coreClinicalConcept
+          : item.text;
+      axesNeedingNormalization.push({ key: axisKey, text: queryTarget });
+    }
+  }
+
+  let normalizedConceptsMap: NormalizedPicoConceptsMap = {};
+  if (axesNeedingNormalization.length > 0) {
+    normalizedConceptsMap = await aiNormalizePicoConcepts(axesNeedingNormalization);
+  }
 
   const mappedBlocks: MappedBlock[] = [];
   for (const item of filteredConcepts) {
@@ -572,8 +364,10 @@ export async function runMultiAgentPipeline(
 
     const axisKey = item.type.toLowerCase() as 'p' | 'i' | 'c' | 'o' | 'not';
     const englishHints = settings.qualifications?.[axisKey]?.englishCoreTerms;
+    const atomicConcepts =
+      settings.qualifications?.[axisKey]?.atomicConcepts ?? normalizedConceptsMap[axisKey];
 
-    const meshDetails = await searchNcbiMesh(queryTarget, item.type, englishHints);
+    const meshDetails = await searchNcbiMesh(queryTarget, item.type, englishHints, atomicConcepts);
 
     if (!meshDetails && item.type === 'C' && !droppedComparatorReason) {
       droppedComparatorReason = 'unresolved_mesh';
@@ -696,13 +490,12 @@ export async function runMultiAgentPipeline(
   });
 
   const aiConfig = getAiConfig();
-  const isDeterministicProvider = aiConfig.provider === 'deterministic';
   const providerLabel = getActiveProviderLabel(aiConfig, 'reasoning');
 
   onStepProgress?.(
     5,
     'running',
-    `Audit clinique & méthodologique (${isDeterministicProvider ? 'Contrôles PRESS' : providerLabel})...`
+    `Audit clinique & méthodologique (${providerLabel})...`
   );
 
   let critiqueReport: CritiqueReport = pressReport;
@@ -716,7 +509,7 @@ export async function runMultiAgentPipeline(
       recommendations: ["Renseignez au minimum l'axe Population (P) et Intervention (I)."],
       pressBreakdown: pressReport.pressBreakdown
     };
-  } else if (!isDeterministicProvider) {
+  } else {
     try {
       const aiCritique = await aiAuditAndCritiqueQuery(
         effectiveAuditPico,
@@ -745,9 +538,30 @@ export async function runMultiAgentPipeline(
           evaluatorModel: aiCritique.evaluatorModel
         };
       }
-    } catch {
-      // Conservation du rapport déterministe PRESS en cas d'indisponibilité réseau/IA
-      critiqueReport = pressReport;
+    } catch (err: unknown) {
+      const auditErr = mapErrorToUserMessage(err);
+      const degradedObservations: AuditObservationEntry[] = [
+        ...pressReport.observations,
+        { severity: 'warning', text: `Audit qualitatif IA indisponible : ${auditErr}` }
+      ];
+      const finalized = finalizePressStatus(
+        pressReport,
+        degradedObservations,
+        liveResult.count,
+        false
+      );
+      critiqueReport = {
+        ...pressReport,
+        observations: degradedObservations,
+        recommendations: [
+          ...pressReport.recommendations,
+          `Vérifiez votre configuration IA dans les Paramètres : ${auditErr}`
+        ],
+        pressStatus: finalized.pressStatus,
+        pressAlertCount: finalized.pressAlertCount,
+        evaluatorModel: 'Contrôles PRESS (Audit IA indisponible)',
+        auditError: auditErr
+      };
     }
   }
 

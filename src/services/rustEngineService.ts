@@ -4,8 +4,7 @@
  */
 
 import { queryPubMedLive } from './pubmedApi';
-import { parseClinicalAbstractNLP } from './multiAgentWorkflow';
-import { searchNcbiMesh } from './meshDatabase';
+import { searchNcbiMesh, AtomicConceptInput } from './meshDatabase';
 
 export interface PubMedArticle {
   pmid: string;
@@ -728,30 +727,24 @@ export interface CritiqueReport {
   pressAlertCount?: number;
   source?: 'gemini' | 'openai' | 'anthropic' | 'rules';
   evaluatorModel?: string;
+  auditError?: string;
 }
 
 export type LegacyCritiqueReport = Omit<CritiqueReport, 'observations'> & {
   observations: string[];
 };
 
-export async function initRustWasmEngine(): Promise<null> {
-  return null;
-}
-
 export async function queryPubMedRust(query: string, options: { maxResults?: number; sort?: string } = {}): Promise<PubMedResponse> {
   return await queryPubMedLive(query, options);
-}
-
-export async function parseClinicalAbstractRust(text: string): Promise<{ p: string; i: string; c: string; o: string }> {
-  return await parseClinicalAbstractNLP(text);
 }
 
 export async function searchMeshRust(
   term: string,
   targetAxis?: 'P' | 'I' | 'C' | 'O' | 'NOT',
-  englishHints?: readonly string[]
+  englishHints?: readonly string[],
+  atomicConcepts?: readonly AtomicConceptInput[]
 ): Promise<MeshDetails | null> {
-  return await searchNcbiMesh(term, targetAxis, englishHints);
+  return await searchNcbiMesh(term, targetAxis, englishHints, atomicConcepts);
 }
 
 /**
@@ -862,14 +855,14 @@ function collectSyntaxDefectsForPress(
 const INPUT_TERM_NOISE_WORDS = new Set<string>([
   'adulte', 'adultes', 'patient', 'patients', 'sujet', 'sujets', 'femme', 'femmes',
   'homme', 'hommes', 'population', 'populations', 'inhibiteur', 'inhibiteurs',
-  'cotransporteur', 'cotransporteurs', 'traitement', 'traitements', 'prise', 'charge',
+  'traitement', 'traitements', 'prise', 'charge',
   'standard', 'standards', 'absence', 'exposition', 'placebo', 'variation', 'variations',
   'etude', 'etudes', 'chronique', 'chroniques', 'aigue', 'aigues', 'secondaire',
   'secondaires', 'primaire', 'primaires', 'maladie', 'maladies', 'syndrome', 'syndromes',
   'trouble', 'troubles', 'risque', 'risques', 'survenue', 'facteur', 'facteurs',
   'forme', 'formes', 'severe', 'severes', 'modere', 'moderee', 'efficacite', 'securite',
   'tolerance', 'evaluation', 'critere', 'criteres', 'jugement', 'principal', 'principale',
-  'exces', 'ponderal', 'corporel', 'corporelle', 'habituelle', 'habituel', 'restriction',
+  'corporel', 'corporelle', 'restriction',
   'prevention', 'controle', 'induit', 'induite', 'induits', 'induites', 'chimiquement',
   'association', 'associe', 'associee', 'associes', 'associees', 'comparaison', 'compare',
   'severity', 'severe', 'moderate', 'moderately', 'mild', 'acute', 'chronic', 'stable',

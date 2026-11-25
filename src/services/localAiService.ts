@@ -1,12 +1,12 @@
 /**
- * Service d'Intelligence Artificielle Cloud Multi-Fournisseurs & FinOps pour MeSHcraft Studio
+ * Service d'Intelligence Artificielle Cloud Multi-Fournisseurs pour MeSHcraft Studio
  *
  * Supporte :
- * 1. Google Gemini Cloud (Pay-As-You-Go Tier 1 / Gratuit : gemini-1.5-pro + gemini-1.5-flash)
- * 2. OpenAI Cloud (Pay-As-You-Go : gpt-4o + gpt-4o-mini)
- * 3. Anthropic Claude Cloud (Pay-As-You-Go : claude-3-5-sonnet-latest + claude-3-5-haiku-latest)
- * 4. Routage Intelligent par Tâche (Smart Routing : Modèle Pro pour Cadrage PICO/Audit, Modèle Flash/Mini/Haiku pour Screening par lots)
- * 5. Optimisations FinOps : Compression des résumés, Cache d'idempotence (PMID + PICO) et Mega-Batching
+ * 1. Google Gemini Cloud (gemini-pro-latest + gemini-flash-latest + gemini-flash-lite-latest)
+ * 2. OpenAI Cloud (gpt-4o + gpt-4o-mini)
+ * 3. Anthropic Claude Cloud (claude-3-5-sonnet-latest + claude-3-5-haiku-latest)
+ * 4. Routage Intelligent par Tâche (Smart Routing : Pro/Sonnet/GPT-4o pour Raisonnement/Audit, Flash/Mini/Haiku pour Dépouillement)
+ * 5. Optimisations : Compression des résumés, Cache d'idempotence (PMID + PICO) et Traitement par lots
  */
 
 import {
@@ -19,9 +19,9 @@ import {
   stripLeadingObservationEmojis
 } from './rustEngineService';
 
-export type AiProvider = 'gemini' | 'openai' | 'anthropic' | 'deterministic';
+export type AiProvider = 'gemini' | 'openai' | 'anthropic';
 export type AiRoutingMode = 'smart' | 'pro_only' | 'economy';
-export type AiTaskTier = 'reasoning' | 'batch';
+export type AiTaskTier = 'reasoning' | 'batch' | 'fast';
 export type AiRateLimitMode = 'payg' | 'free_tier';
 
 export interface AiConfig {
@@ -105,16 +105,17 @@ export function normalizeGeminiModel(model?: string, tier: AiTaskTier = 'reasoni
 }
 
 function normalizeProvider(rawProvider?: string): AiProvider {
-  if (rawProvider === 'openai' || rawProvider === 'anthropic' || rawProvider === 'deterministic') {
+  if (rawProvider === 'openai' || rawProvider === 'anthropic') {
     return rawProvider;
   }
   return 'gemini';
 }
 
 /**
- * Sélectionne automatiquement le modèle optimal selon la criticité cognitive de la tâche (FinOps Smart Routing) :
- * - 'reasoning' (Extraction PICO Agent 1 & Audit PRESS Agent 2) -> Modèle Pro / Sonnet / GPT-4o
- * - 'batch' (Screening massif Titre/Résumé Agent 3 & RoB 2 Agent 4) -> Modèle Flash / Mini / Haiku
+ * Sélectionne automatiquement le modèle optimal selon la criticité cognitive de la tâche (Smart Routing) :
+ * - 'reasoning' (Audit PRESS) -> Modèle Pro / Sonnet / GPT-4o
+ * - 'fast' (Structuration PICO/PECO) -> Modèle Flash / Mini / Haiku
+ * - 'batch' (Screening massif Titre/Résumé & RoB 2) -> Modèle Flash-Lite / Mini / Haiku
  */
 export function resolveActiveModelForTask(config: AiConfig, taskTier: AiTaskTier = 'reasoning'): string {
   const effectiveTier: AiTaskTier =
@@ -136,20 +137,17 @@ export function resolveActiveModelForTask(config: AiConfig, taskTier: AiTaskTier
       : (config.anthropicBatchModel || 'claude-3-5-haiku-latest');
   }
 
-  if (config.provider === 'gemini') {
-    return effectiveTier === 'reasoning'
-      ? normalizeGeminiModel(config.geminiModel || 'gemini-pro-latest', 'reasoning')
-      : normalizeGeminiModel(config.geminiBatchModel || 'gemini-flash-lite-latest', 'batch');
+  if (effectiveTier === 'reasoning') {
+    return normalizeGeminiModel(config.geminiModel || 'gemini-pro-latest', 'reasoning');
   }
-
-  return 'Règles PRISMA / NLM';
+  if (effectiveTier === 'fast') {
+    return 'gemini-flash-latest';
+  }
+  return normalizeGeminiModel(config.geminiBatchModel || 'gemini-flash-lite-latest', 'batch');
 }
 
 export function getActiveProviderLabel(config?: AiConfig, taskTier: AiTaskTier = 'reasoning'): string {
   const active = config || getAiConfig();
-  if (active.provider === 'deterministic') {
-    return 'Règles PRISMA (Déterministe)';
-  }
   const modelName = resolveActiveModelForTask(active, taskTier);
   if (active.provider === 'openai') {
     return `OpenAI (${modelName})`;
@@ -343,7 +341,9 @@ async function buildGeminiModelCascade(primaryModel: string, apiKey: string, tas
   const orderedDefaults =
     taskTier === 'batch'
       ? ['gemini-flash-lite-latest', 'gemini-flash-latest', 'gemini-pro-latest']
-      : ['gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest'];
+      : taskTier === 'fast'
+        ? ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-pro-latest']
+        : ['gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest'];
 
   const fallbacks = [
     normalizeGeminiModel(primaryModel, taskTier),
@@ -612,11 +612,12 @@ export async function testAiConnectionLive(
 
   return {
     online: false,
-    provider: 'Moteur Déterministe (Sans LLM)',
-    models: [],
-    activeModel: 'Règles MeSH / NLM',
+    provider: 'Google Gemini',
+    models: [...GEMINI_FALLBACK_MODELS],
+    activeModel: activeReasoningModel,
+    batchModel: activeBatchModel,
     routingMode: config.routingMode,
-    message: 'Aucun fournisseur IA configuré.'
+    message: 'Clé API Google Gemini manquante.'
   };
 }
 
@@ -707,7 +708,7 @@ async function runGeminiProvider(
   if (primaryModel === 'auto') {
     const discovered = await fetchDiscoveredGeminiModels(cleanKey);
     primaryModel =
-      taskTier === 'batch'
+      taskTier === 'batch' || taskTier === 'fast'
         ? (discovered.find((m) => m.includes('flash')) || discovered[0] || 'gemini-flash-latest')
         : (discovered.find((m) => m.includes('pro')) || discovered.find((m) => m.includes('flash')) || 'gemini-pro-latest');
   }
@@ -850,7 +851,8 @@ async function runOpenAiProvider(
               ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
               { role: 'user', content: prompt }
             ],
-            temperature: 0.1
+            temperature: 0.1,
+            ...(/json/i.test(`${systemPrompt || ''} ${prompt}`) ? { response_format: { type: 'json_object' } } : {})
           }),
           signal: combineAbortSignals(timeoutMs, abortSignal)
         });
@@ -1024,25 +1026,6 @@ export async function queryAiModel(
   }
 
   const config = getAiConfig();
-  if (config.provider === 'deterministic') {
-    return null;
-  }
-
-  // En environnement de test unitaire sans clé API configurée, basculer immédiatement sur le repli déterministe
-  const isTestEnv =
-    typeof process !== 'undefined' &&
-    Boolean((process as unknown as { env?: Record<string, unknown> }).env?.VITEST);
-  const activeKey =
-    config.provider === 'gemini'
-      ? cleanApiKey(config.geminiApiKey)
-      : config.provider === 'openai'
-        ? cleanApiKey(config.openaiApiKey)
-        : cleanApiKey(config.anthropicApiKey);
-
-  if (isTestEnv && !activeKey) {
-    return null;
-  }
-
   const orderedProviders: CloudProvider[] = [config.provider];
   const candidateFallbacks: readonly CloudProvider[] = ['gemini', 'openai', 'anthropic'];
   for (const fallbackProvider of candidateFallbacks) {
@@ -1220,6 +1203,16 @@ export type PicoAxisRole =
   | 'passive_comparator'
   | 'demographic_unrestricted';
 
+export interface NormalizedAtomicConcept {
+  readonly conceptFr: string;
+  readonly conceptEn: string;
+  readonly synonymsTiab: readonly string[];
+}
+
+export type NormalizedPicoConceptsMap = Partial<
+  Record<'p' | 'i' | 'c' | 'o' | 'not', readonly NormalizedAtomicConcept[]>
+>;
+
 /**
  * Qualification morpho-sémantique d'un axe PICO/PECO produite par l'orchestrateur LLM
  * ou par l'analyseur morphosyntaxique déterministe.
@@ -1229,6 +1222,7 @@ export interface AxisSemanticQualification {
   readonly impliedSubheadings: readonly string[];
   readonly coreClinicalConcept: string;
   readonly englishCoreTerms: readonly string[];
+  readonly atomicConcepts?: readonly NormalizedAtomicConcept[];
 }
 
 export interface PicoSemanticQualifications {
@@ -1250,6 +1244,7 @@ export interface PicoSemanticQualifications {
  * AGENT 1 AUGMENTÉ : Extraction Clinique PICO Experte
  */
 export interface ClinicalPicoExtractionResult {
+  approach?: 'pico' | 'peco';
   p: string;
   i: string;
   c: string;
@@ -1257,6 +1252,7 @@ export interface ClinicalPicoExtractionResult {
   not: string;
   qualifications?: PicoSemanticQualifications;
   source?: 'gemini' | 'openai' | 'anthropic' | 'rules';
+  modelUsed?: string;
   confidence?: number;
   reasoning?: string;
 }
@@ -1545,183 +1541,171 @@ function sanitizeAxisQualification(
  * AGENT 1 AUGMENTÉ : Extraction Clinique PICO/PECO & Qualification Morpho-Sémantique par LLM
  * Respecte rigoureusement la Constitution gemini.md, PRISMA-S et le Cochrane Handbook.
  */
-export async function aiExtractClinicalPico(rawText: string): Promise<ClinicalPicoExtractionResult | null> {
+export async function aiExtractClinicalPico(rawText: string): Promise<ClinicalPicoExtractionResult> {
   const config = getAiConfig();
-  const providerSource: 'gemini' | 'openai' | 'anthropic' | 'rules' =
-    config.provider === 'deterministic' ? 'rules' : config.provider;
+  const activeKey =
+    config.provider === 'gemini'
+      ? cleanApiKey(config.geminiApiKey)
+      : config.provider === 'openai'
+        ? cleanApiKey(config.openaiApiKey)
+        : config.provider === 'anthropic'
+          ? cleanApiKey(config.anthropicApiKey)
+          : '';
 
-  const system = `Tu es un médecin méthodologiste senior et ingénieur en informatique médicale expert du thésaurus NLM MeSH, de PRISMA-S et du Cochrane Handbook.
-Ta mission est double :
-1. Extraire les concepts cliniques PICO/PECO atomiques dans la langue d'origine (sans jamais inventer de balises [Mesh]/[tiab] ni mettre de traductions anglaises entre parenthèses dans les champs p, i, c, o, not) et développer systématiquement les sigles et abréviations cliniques en toutes lettres dans ces champs (ex: IDM -> Infarctus du myocarde, AVC -> Accident vasculaire cérébral, ICFEp/FEVG -> Insuffisance cardiaque à fraction d'éjection préservée, IMC -> Indice de masse corporelle, EI -> Effet indésirable).
-2. Qualifier sémantiquement et morphologiquement chaque axe dans l'objet "qualifications" (axisRole, impliedSubheadings NLM officiels, coreClinicalConcept épuré de son adjectif causal, et englishCoreTerms pour chaque axe actif en vue d'une validation stricte contre NCBI Entrez Dxxxxxx) pour piloter le compilateur booléen Rust/WASM.
-3. DIRECTIVE PUNITIVE STRICTE : INTERDICTION ABSOLUE de placer le mot "Pharmacovigilance", "Iatrogénie" ou "Effet indésirable" dans l'Axe O. L'Axe O ne reçoit QUE la maladie (ex: Syndrome parkinsonien). Tout concept d'iatrogénie DOIT aller dans l'Axe I.
-4. COURT-CIRCUIT DES COMPARATEURS PASSIFS ET DÉMOGRAPHIES NON RESTREINTES : Force OBLIGATOIREMENT "c": false dès que le comparateur est de type "passive_comparator" ("Absence d'exposition", "Soins courants") et "p": false si la population est "demographic_unrestricted".
-5. RÉSOLUTION DE LA GRANULARITÉ DE L'EXPOSITION (AXE I) :
-- Niveau Spécifique : Si le texte énumère des entités précises (liste de molécules, vaccins nommés, implants spécifiques), extrais-les intégralement dans l'axe I.
-- Niveau Générique (Concept Parapluie) : Si le texte désigne l'exposition par un terme générique de classe (ex: 'les médicaments', 'la chirurgie', 'les pesticides') comme CAUSE d'un effet indésirable, NE LE TRADUIS JAMAIS par le produit commercial (interdit d'utiliser 'Pharmaceutical Preparations' ou 'Surgical Instruments'). Tu DOIS le traduire par le concept de sécurité ou d'iatrogénie associé (ex: 'Effets indésirables médicamenteux', 'Pharmacovigilance', 'Complications post-opératoires').
-- Sous-descripteur de Causalité : Dans tous les cas, si la pathologie (Axe O) est induite par une exposition, tu DOIS impérativement ajouter le sous-descripteur étiologique pertinent (ex: 'chemically induced', 'etiology', 'adverse effects') dans son tableau impliedSubheadings.
-Réponds EXCLUSIVEMENT avec un objet JSON strictement conforme au contrat demandé.`;
+  const hasAnyKey =
+    hasConfiguredProviderKey(config, 'gemini') ||
+    hasConfiguredProviderKey(config, 'openai') ||
+    hasConfiguredProviderKey(config, 'anthropic');
 
-  const prompt = `Analyse le protocole, la question de recherche ou le résumé clinique ci-dessous et extrais la structure PICO/PECO ainsi que les qualifications morpho-sémantiques de chaque axe.
+  if (!activeKey && !hasAnyKey) {
+    throw new Error(
+      "Aucune clé API IA n'est configurée. Veuillez renseigner une clé Google Gemini, OpenAI ou Anthropic dans les Paramètres pour structurer votre question clinique."
+    );
+  }
 
-PRINCIPES MÉTHODOLOGIQUES IMPÉRATIFS (RIGUEUR TERMINOLOGIQUE MeSH & LOGIQUE BOOLÉENNE PURE) :
-1. SÉPARATION STRICTE EXPOSITION (I/E) != ÉVÉNEMENT CLINIQUE (O) :
-   - INTERDICTION ABSOLUE de placer le mot "Pharmacovigilance", "Iatrogénie" ou "Effet indésirable" dans l'Axe O. L'Axe O ne reçoit QUE la maladie (ex: Syndrome parkinsonien). Tout concept d'iatrogénie DOIT aller dans l'Axe I.
-   - Si le texte étudie une pathologie causée par des médicaments :
-     * L'axe "i" reçoit soit la liste complète des molécules (DCI) mentionnées dans le texte (sans la tronquer !), soit le concept générique "Effets indésirables médicamenteux, Pharmacovigilance" si aucune liste de DCI n'est fournie.
-     * L'axe "o" reçoit UNIQUEMENT le phénotype ou la pathologie clinique cible (ex: "Syndrome parkinsonien secondaire induit chimiquement").
-2. ISOLATION DU NOYAU NOSOLOGIQUE ("coreClinicalConcept") ET DES SOUS-DESCRIPTEURS ("impliedSubheadings") :
-   - Lorsqu'un axe mentionne une pathologie induite par un médicament ou une substance (ex: "Syndrome parkinsonien médicamenteux", "Pancréatite aiguë induite chimiquement"), qualifie son axisRole en "induced_syndrome", ajoute "chemically induced" dans "impliedSubheadings", et place dans "coreClinicalConcept" le noyau nosologique pur débarrassé de l'adjectif causal (ex: "Syndrome parkinsonien secondaire").
-   - Fournis dans "englishCoreTerms" les descripteurs ou radicaux nosologiques anglais correspondants (ex: ["Parkinson Disease, Secondary", "Parkinsonian Disorders", "parkinsonism", "parkinsonian"]).
-3. QUALIFICATION DES RÔLES D'AXES ("axisRole") :
-   - "drug_inn_list" : Énumération de dénominations communes internationales (DCI / molécules pharmacologiques).
-   - "iatrogenic_generic" : Exposition médicamenteuse générique / pharmacovigilance / effets indésirables sans liste de molécules.
-   - "induced_syndrome" : Pathologie ou syndrome induit chimiquement / d'origine médicamenteuse (requiert impliedSubheadings: ["chemically induced"]).
-   - "clinical_condition" : Pathologie, population clinique spécifique, intervention non pharmacologique ou critère de jugement standard.
-   - "passive_comparator" : Comparateur passif non discriminant documentairement ("Alimentation habituelle", "Absence d'exposition", "Soins courants", "Placebo ou comparateur actif").
-   - "demographic_unrestricted" : Population générale adulte non restreinte à une maladie spécifique ("Adultes >= 18 ans", "Adultes en soins primaires").
-4. COURT-CIRCUIT DES COMPARATEURS PASSIFS ET DÉMOGRAPHIES NON RESTREINTES ("recommendedActivePico") :
-   - Force OBLIGATOIREMENT "c": false dès que le comparateur est de type "passive_comparator" (ne jamais envoyer "Absence d'exposition" ou "Soins courants" dans l'équation).
-   - Force OBLIGATOIREMENT "p": false si la population est "demographic_unrestricted".
-5. RÉSOLUTION DE LA GRANULARITÉ DE L'EXPOSITION (AXE I) :
-   - Niveau Spécifique : Si le texte énumère des entités précises (liste de molécules, vaccins nommés, implants spécifiques), extrais-les intégralement dans l'axe I.
-   - Niveau Générique (Concept Parapluie) : Si le texte désigne l'exposition par un terme générique de classe (ex: 'les médicaments', 'la chirurgie', 'les pesticides') comme CAUSE d'un effet indésirable, NE LE TRADUIS JAMAIS par le produit commercial (interdit d'utiliser 'Pharmaceutical Preparations' ou 'Surgical Instruments'). Tu DOIS le traduire par le concept de sécurité ou d'iatrogénie associé (ex: 'Effets indésirables médicamenteux', 'Pharmacovigilance', 'Complications post-opératoires').
-   - Sous-descripteur de Causalité : Dans tous les cas, si la pathologie (Axe O) est induite par une exposition, tu DOIS impérativement ajouter le sous-descripteur étiologique pertinent (ex: 'chemically induced', 'etiology', 'adverse effects') dans son tableau impliedSubheadings.
-6. DÉVELOPPEMENT DES SIGLES ET CANDIDATS ANGLOPHONES NLM :
-   - Développe systématiquement en toutes lettres tous les sigles et abréviations cliniques dans les champs français p, i, c, o, not (ex: IDM -> Infarctus du myocarde, AVC -> Accident vasculaire cérébral, ICFEp/FEVG -> Insuffisance cardiaque à fraction d'éjection préservée, IMC -> Indice de masse corporelle, EI -> Effet indésirable).
-   - Pour chaque axe actif (p, i, c, o, not), renseigne dans "englishCoreTerms" des concepts cliniques anglais atomiques concis (2 à 5 mots max) servant de candidats secondaires pour interrogation officielle NCBI Entrez (db=mesh).
+  const resolvedProvider: CloudProvider =
+    activeKey
+      ? config.provider
+      : hasConfiguredProviderKey(config, 'gemini')
+        ? 'gemini'
+        : hasConfiguredProviderKey(config, 'openai')
+          ? 'openai'
+          : 'anthropic';
+  const modelUsed = resolveActiveModelForTask({ ...config, provider: resolvedProvider }, 'fast');
 
-Réponds STRICTEMENT au format JSON suivant :
+  const system = `Tu es un médecin méthodologiste expert du thésaurus NLM MeSH et de PRISMA-S.
+Extrais les axes PICO/PECO d'une question clinique en concepts atomiques concis dans la langue d'origine (sans balises [Mesh]/[tiab] ni traductions entre parenthèses, avec sigles développés en toutes lettres).
+Règles strictes :
+- Détermine "approach": "peco" (exposition/étiologie/risque observationnel) ou "pico" (intervention thérapeutique/préventive/diagnostique).
+- Sépare l'exposition (I/E) de l'événement clinique (O) : ne mets jamais "Pharmacovigilance" ou "Effet indésirable" dans O.
+- Pour une pathologie induite par une substance, mets axisRole "induced_syndrome" et impliedSubheadings ["chemically induced"] dans O, avec le noyau nosologique pur dans coreClinicalConcept.
+- Mets recommendedActivePico.c=false pour un comparateur passif (placebo, soins courants, absence d'exposition) et c=true pour un comparateur actif nommé. Mets p=false uniquement si la population est purement démographique sans pathologie.
+- Fournis 2 à 5 "englishCoreTerms" concis par axe actif pour la résolution NCBI Entrez.
+Réponds EXCLUSIVEMENT en JSON valide.`;
+
+  const prompt = `Extrais la structure PICO/PECO au format JSON strict :
 {
-  "p": "Concepts cliniques concis de la population en français, sigles développés (sans parenthèses anglaises)",
-  "i": "Liste intégrale des molécules (DCI) ou concept d'intervention/exposition en français, sigles développés",
-  "c": "Comparateur concis en français",
-  "o": "UNIQUEMENT la maladie / phénotype clinique cible en français, sigles développés (SANS Pharmacovigilance ni Iatrogénie)",
-  "not": "Critères d'exclusion explicites en français, sigles développés (ou chaîne vide si aucun)",
+  "approach": "pico | peco",
+  "p": "Population / pathologie cible (ou chaîne vide)",
+  "i": "Intervention ou exposition (ou chaîne vide)",
+  "c": "Comparateur actif ou passif (ou chaîne vide)",
+  "o": "Critère(s) de jugement / pathologie cible (ou chaîne vide)",
+  "not": "Critères d'exclusion explicites (ou chaîne vide)",
   "qualifications": {
-    "p": {
-      "axisRole": "clinical_condition | demographic_unrestricted",
-      "impliedSubheadings": [],
-      "coreClinicalConcept": "Noyau clinique pur en français",
-      "englishCoreTerms": ["English Descriptor 1", "English Term 2"]
-    },
-    "i": {
-      "axisRole": "drug_inn_list | iatrogenic_generic | clinical_condition",
-      "impliedSubheadings": [],
-      "coreClinicalConcept": "Noyau de l'intervention/exposition",
-      "englishCoreTerms": ["English INN or Mesh 1", "English INN or Mesh 2"]
-    },
-    "c": {
-      "axisRole": "passive_comparator | clinical_condition",
-      "impliedSubheadings": [],
-      "coreClinicalConcept": "Noyau du comparateur",
-      "englishCoreTerms": []
-    },
-    "o": {
-      "axisRole": "induced_syndrome | clinical_condition",
-      "impliedSubheadings": ["chemically induced"],
-      "coreClinicalConcept": "Noyau nosologique pur sans adjectif causal ni pharmacovigilance",
-      "englishCoreTerms": ["Official NLM Descriptor 1", "Official NLM Descriptor 2", "derived_stem_ism", "derived_stem_ian"]
-    },
-    "not": {
-      "axisRole": "clinical_condition",
-      "impliedSubheadings": [],
-      "coreClinicalConcept": "Noyau du critère d'exclusion",
-      "englishCoreTerms": ["English Exclusion Term 1"]
-    },
-    "recommendedActivePico": {
-      "p": true,
-      "i": true,
-      "c": false,
-      "o": true,
-      "not": false
-    }
+    "p": { "axisRole": "clinical_condition | demographic_unrestricted", "impliedSubheadings": [], "coreClinicalConcept": "", "englishCoreTerms": [] },
+    "i": { "axisRole": "drug_inn_list | iatrogenic_generic | clinical_condition", "impliedSubheadings": [], "coreClinicalConcept": "", "englishCoreTerms": [] },
+    "c": { "axisRole": "passive_comparator | clinical_condition", "impliedSubheadings": [], "coreClinicalConcept": "", "englishCoreTerms": [] },
+    "o": { "axisRole": "induced_syndrome | clinical_condition", "impliedSubheadings": [], "coreClinicalConcept": "", "englishCoreTerms": [] },
+    "not": { "axisRole": "clinical_condition", "impliedSubheadings": [], "coreClinicalConcept": "", "englishCoreTerms": [] },
+    "recommendedActivePico": { "p": true, "i": true, "c": false, "o": true, "not": false }
   },
   "confidence": 95,
   "reasoning": "Justification méthodologique concise en 1 phrase."
 }
 
-Texte clinique à analyser :
+Texte clinique :
 """
 ${rawText}
 """`;
 
-  const rawResponse = await queryAiModel(prompt, system, 'reasoning');
-  if (!rawResponse) return null;
+  const rawResponse = await queryAiModel(prompt, system, 'fast');
+  if (!rawResponse || !rawResponse.trim()) {
+    throw new Error(
+      mapErrorToUserMessage(
+        !activeKey
+          ? 'Clé API Cloud non configurée.'
+          : "Le modèle IA a renvoyé une réponse vide lors de la structuration PICO/PECO."
+      )
+    );
+  }
 
   const stripParensFromExtractedPico = (val: string) =>
-    sanitizePicoConcept((val || "").replace(/\([^)]*\)/g, ' ').replace(/\s+/g, ' ').trim());
+    sanitizePicoConcept((val || '').replace(/\([^)]*\)/g, ' ').replace(/\s+/g, ' ').trim());
 
-  try {
-    const parsed = extractJsonFromLlmResponse<Record<string, unknown>>(rawResponse);
-    if (!parsed || (!parsed.p && !parsed.i && !parsed.o)) return null;
+  const parsed = extractJsonFromLlmResponse<Record<string, unknown>>(rawResponse);
+  if (!parsed || (!parsed.p && !parsed.i && !parsed.o)) {
+    throw new Error(
+      "La réponse du modèle IA n'a pas pu être interprétée comme une structure JSON PICO/PECO valide. Veuillez réessayer."
+    );
+  }
 
-    const pClean = stripParensFromExtractedPico(String(parsed.p || ""));
-    let iClean = stripParensFromExtractedPico(String(parsed.i || ""));
-    const cClean = stripParensFromExtractedPico(String(parsed.c || ""));
-    const rawOClean = stripParensFromExtractedPico(String(parsed.o || ""));
-    const oClean = stripIatrogenicTermsFromOutcome(rawOClean);
-    const notClean = stripParensFromExtractedPico(String(parsed.not || ""));
+  const approach: 'pico' | 'peco' | undefined =
+    typeof parsed.approach === 'string' && parsed.approach.toLowerCase() === 'peco'
+      ? 'peco'
+      : typeof parsed.approach === 'string' && parsed.approach.toLowerCase() === 'pico'
+        ? 'pico'
+        : undefined;
 
-    // Si l'axe I est vide alors que l'axe O contenait un terme d'iatrogénie/pharmacovigilance, le transférer dans I
-    if (!iClean && /\b(?:pharmacovigilance|iatrog[ée]n(?:ie|ique)|effets?\s+ind[ée]sirables?)\b/i.test(rawOClean)) {
-      iClean = 'Effets indésirables médicamenteux, Pharmacovigilance';
-    }
+  const pClean = stripParensFromExtractedPico(String(parsed.p || ''));
+  let iClean = stripParensFromExtractedPico(String(parsed.i || ''));
+  const cClean = stripParensFromExtractedPico(String(parsed.c || ''));
+  const rawOClean = stripParensFromExtractedPico(String(parsed.o || ''));
+  const oClean = stripIatrogenicTermsFromOutcome(rawOClean);
+  const notClean = stripParensFromExtractedPico(String(parsed.not || ''));
 
-    const rawQuals = (parsed.qualifications && typeof parsed.qualifications === 'object')
+  // Si l'axe I est vide alors que l'axe O contenait un terme d'iatrogénie/pharmacovigilance, le transférer dans I
+  if (!iClean && /\b(?:pharmacovigilance|iatrog[ée]n(?:ie|ique)|effets?\s+ind[ée]sirables?)\b/i.test(rawOClean)) {
+    iClean = 'Effets indésirables médicamenteux, Pharmacovigilance';
+  }
+
+  const rawQuals =
+    parsed.qualifications && typeof parsed.qualifications === 'object'
       ? (parsed.qualifications as Record<string, unknown>)
       : {};
 
-    const pQual = sanitizeAxisQualification(rawQuals.p, 'P', pClean);
-    const iQual = sanitizeAxisQualification(rawQuals.i, 'I', iClean);
-    const cQual = sanitizeAxisQualification(rawQuals.c, 'C', cClean);
-    const oQual = sanitizeAxisQualification(rawQuals.o, 'O', oClean);
-    const notQual = sanitizeAxisQualification(rawQuals.not, 'NOT', notClean);
+  const pQual = sanitizeAxisQualification(rawQuals.p, 'P', pClean);
+  const iQual = sanitizeAxisQualification(rawQuals.i, 'I', iClean);
+  const cQual = sanitizeAxisQualification(rawQuals.c, 'C', cClean);
+  const oQual = sanitizeAxisQualification(rawQuals.o, 'O', oClean);
+  const notQual = sanitizeAxisQualification(rawQuals.not, 'NOT', notClean);
 
-    const rawRecActive = (rawQuals.recommendedActivePico && typeof rawQuals.recommendedActivePico === 'object')
+  const rawRecActive =
+    rawQuals.recommendedActivePico && typeof rawQuals.recommendedActivePico === 'object'
       ? (rawQuals.recommendedActivePico as Record<string, unknown>)
       : null;
 
-    // COURT-CIRCUIT FORCÉ (Hard Drop) : passive_comparator et demographic_unrestricted forcent l'inactivation
-    const recommendedActivePico = {
-      p:
-        pQual.axisRole === 'demographic_unrestricted'
-          ? false
-          : rawRecActive && typeof rawRecActive.p === 'boolean'
-            ? rawRecActive.p
-            : Boolean(pClean),
-      i: Boolean(iClean),
-      c:
-        cQual.axisRole === 'passive_comparator'
-          ? false
-          : rawRecActive && typeof rawRecActive.c === 'boolean'
-            ? rawRecActive.c && Boolean(cClean)
-            : Boolean(cClean),
-      o: Boolean(oClean),
-      not: Boolean(notClean)
-    };
+  // COURT-CIRCUIT FORCÉ (Hard Drop) : passive_comparator et demographic_unrestricted forcent l'inactivation
+  const recommendedActivePico = {
+    p:
+      pQual.axisRole === 'demographic_unrestricted'
+        ? false
+        : rawRecActive && typeof rawRecActive.p === 'boolean'
+          ? rawRecActive.p
+          : Boolean(pClean),
+    i: Boolean(iClean),
+    c:
+      cQual.axisRole === 'passive_comparator'
+        ? false
+        : rawRecActive && typeof rawRecActive.c === 'boolean'
+          ? rawRecActive.c && Boolean(cClean)
+          : Boolean(cClean),
+    o: Boolean(oClean),
+    not: Boolean(notClean)
+  };
 
-    return {
-      p: pClean,
-      i: iClean,
-      c: cClean,
-      o: oClean,
-      not: notClean,
-      qualifications: {
-        p: pQual,
-        i: iQual,
-        c: cQual,
-        o: oQual,
-        not: notQual,
-        recommendedActivePico
-      },
-      source: providerSource,
-      confidence: typeof parsed.confidence === 'number' ? Math.min(100, Math.max(50, parsed.confidence)) : 95,
-      reasoning: typeof parsed.reasoning === 'string' ? parsed.reasoning : "Extraction et qualification morpho-sémantique par IA médicale"
-    };
-  } catch {
-    return null;
-  }
+  return {
+    ...(approach ? { approach } : {}),
+    p: pClean,
+    i: iClean,
+    c: cClean,
+    o: oClean,
+    not: notClean,
+    qualifications: {
+      p: pQual,
+      i: iQual,
+      c: cQual,
+      o: oQual,
+      not: notQual,
+      recommendedActivePico
+    },
+    source: resolvedProvider,
+    modelUsed,
+    confidence: typeof parsed.confidence === 'number' ? Math.min(100, Math.max(50, parsed.confidence)) : 95,
+    reasoning:
+      typeof parsed.reasoning === 'string' && parsed.reasoning.trim()
+        ? parsed.reasoning.trim()
+        : 'Structuration PICO/PECO générée par IA'
+  };
 }
 
 const AUDIT_AGENT_SYSTEM_PROMPT = `Tu es un méthodologiste senior en recherche documentaire biomédicale, expert des référentiels PRISMA 2020, PRISMA-S, de la grille PRESS 2015 et du Cochrane Handbook.
@@ -1875,50 +1859,126 @@ Réponds STRICTEMENT au format JSON suivant :
 }`;
 
   const rawResponse = await queryAiModel(prompt, AUDIT_AGENT_SYSTEM_PROMPT, 'reasoning');
-  if (!rawResponse) return null;
-
-  try {
-    const parsed = extractJsonFromLlmResponse<{
-      score?: number;
-      observations?: unknown[];
-      recommendations?: unknown[];
-    }>(rawResponse);
-    if (parsed && Array.isArray(parsed.observations)) {
-      const config = getAiConfig();
-      const source: 'gemini' | 'openai' | 'anthropic' | 'rules' =
-        config.provider === 'deterministic' ? 'rules' : config.provider;
-      const evaluatorModel = resolveActiveModelForTask(config, 'reasoning');
-      const normalizedObservations = normalizeAuditObservations(parsed.observations);
-      const cleanRecommendations = Array.isArray(parsed.recommendations)
-        ? parsed.recommendations
-            .map((r) => stripLeadingObservationEmojis(String(r || '')))
-            .filter((r) => r.length > 0)
-        : [];
-
-      return {
-        score: typeof parsed.score === 'number' ? Math.min(100, Math.max(0, parsed.score)) : 0,
-        observations: normalizedObservations,
-        recommendations: cleanRecommendations,
-        source,
-        evaluatorModel
-      };
-    }
-  } catch (err) {
-    console.warn('Échec parsing rapport audit IA:', err);
+  if (!rawResponse || !rawResponse.trim()) {
+    throw new Error("Le modèle IA a renvoyé une réponse vide lors de l'audit méthodologique.");
   }
 
-  return null;
+  const parsed = extractJsonFromLlmResponse<{
+    score?: number;
+    observations?: unknown[];
+    recommendations?: unknown[];
+  }>(rawResponse);
+  if (!parsed || !Array.isArray(parsed.observations)) {
+    throw new Error("La réponse de l'audit IA n'a pas pu être interprétée comme un JSON valide.");
+  }
+
+  const config = getAiConfig();
+  const evaluatorModel = resolveActiveModelForTask(config, 'reasoning');
+  const normalizedObservations = normalizeAuditObservations(parsed.observations);
+  const cleanRecommendations = Array.isArray(parsed.recommendations)
+    ? parsed.recommendations
+        .map((r) => stripLeadingObservationEmojis(String(r || '')))
+        .filter((r) => r.length > 0)
+    : [];
+
+  return {
+    score: typeof parsed.score === 'number' ? Math.min(100, Math.max(0, parsed.score)) : 0,
+    observations: normalizedObservations,
+    recommendations: cleanRecommendations,
+    source: config.provider,
+    evaluatorModel
+  };
+}
+
+export type PrismaExclusionCategory =
+  | 'population'
+  | 'intervention'
+  | 'comparator'
+  | 'outcome'
+  | 'study_design'
+  | 'preclinical'
+  | 'other';
+
+export const PRISMA_EXCLUSION_CATEGORY_KEYS: readonly PrismaExclusionCategory[] = [
+  'population',
+  'intervention',
+  'comparator',
+  'outcome',
+  'study_design',
+  'preclinical',
+  'other'
+];
+
+export const PRISMA_EXCLUSION_LABELS_FR: Readonly<Record<PrismaExclusionCategory, string>> = {
+  population: 'Population hors périmètre',
+  intervention: 'Intervention / Exposition non conforme',
+  comparator: 'Comparateur non conforme',
+  outcome: 'Critère de jugement absent ou hors périmètre',
+  study_design: 'Plan d\'étude exclu (revue narrative, éditorial, protocole, cas isolé)',
+  preclinical: 'Modèle préclinique (animal ou in vitro)',
+  other: 'Autre motif d\'exclusion'
+};
+
+/**
+ * Résout une clé ou un motif d'exclusion brut vers l'une des 7 catégories PRISMA standardisées.
+ */
+export function resolvePrismaExclusionCategory(
+  rawCategory?: string,
+  rawReason?: string
+): PrismaExclusionCategory {
+  const catNorm = (rawCategory || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (
+    catNorm === 'population' ||
+    catNorm === 'intervention' ||
+    catNorm === 'comparator' ||
+    catNorm === 'outcome' ||
+    catNorm === 'study_design' ||
+    catNorm === 'preclinical' ||
+    catNorm === 'other'
+  ) {
+    return catNorm;
+  }
+
+  const combined = `${rawCategory || ''} ${rawReason || ''}`
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  if (/\b(?:animal|murin|rat|mouse|mice|in\s+vitro|preclin|cellul|ex\s+vivo|cadaver)\b/.test(combined)) {
+    return 'preclinical';
+  }
+  if (/\b(?:editorial|lettre|letter|revue\s+narrative|narrative\s+review|protocole|protocol|cas\s+clinique|case\s+report|plan\s+d['’]etude|study\s+design|comment|hors\s+format|sans\s+donnees\s+originales|congres)\b/.test(combined)) {
+    return 'study_design';
+  }
+  if (/\b(?:comparateur|comparator|temoin|controle|control\s+group)\b/.test(combined)) {
+    return 'comparator';
+  }
+  if (/\b(?:critere\s+de\s+jugement|outcome|endpoint)\b/.test(combined)) {
+    return 'outcome';
+  }
+  if (/\b(?:intervention|exposition|exposure|traitement|molecule|medicament|dispositif|non\s+conforme)\b/.test(combined)) {
+    return 'intervention';
+  }
+  if (/\b(?:population|pediatri|enfant|age|pathologie\s+hors|hors\s+perimetre)\b/.test(combined)) {
+    return 'population';
+  }
+  return 'other';
+}
+
+export function formatPrismaExclusionReason(rawCategory?: string, rawReason?: string): string {
+  return PRISMA_EXCLUSION_LABELS_FR[resolvePrismaExclusionCategory(rawCategory, rawReason)];
 }
 
 export interface BatchScreenItemResult {
   pmid: string;
   status: 'included' | 'maybe' | 'excluded';
+  exclusionCategory?: PrismaExclusionCategory;
   exclusionReason?: string;
   evidenceSnippet?: string;
 }
 
 /**
- * OPTIMISATION FINOPS #1 : Compression sans perte clinique des résumés PubMed avant envoi au LLM.
+ * Compression clinique des résumés PubMed avant envoi au LLM.
  * Supprime les déclarations administratives (conflits d'intérêts, financements, droits d'auteur, affiliations)
  * pour économiser ~20 % de tokens d'entrée tout en préservant les numéros NCT/PROSPERO utiles au RoB 2.
  */
@@ -1936,8 +1996,8 @@ export function compressAbstractForLlm(rawAbstract: string, maxChars = 1200): st
 }
 
 /**
- * OPTIMISATION FINOPS #2 : Empreinte déterministe du PICO et Cache d'Idempotence de Screening.
- * Évite de refacturer un appel API si le même PMID est ré-évalué avec le même cadrage PICO.
+ * Empreinte déterministe du PICO et Cache d'Idempotence de Screening.
+ * Évite de relancer un appel API si le même PMID est ré-évalué avec le même cadrage PICO.
  */
 export function computePicoFingerprint(pico: { p: string; i: string; c: string; o: string; not?: string }): string {
   return [
@@ -1957,7 +2017,7 @@ export function clearAiScreeningCache(): void {
 
 /**
  * AGENT DE SCREENING PAR LOTS (Routé sur le tier 'batch' : Flash / GPT-4o-mini / Haiku) :
- * Évaluation clinique simultanée des articles PubMed avec cache d'idempotence FinOps.
+ * Évaluation clinique simultanée des articles PubMed avec cache d'idempotence.
  * Respecte le principe de précaution Cochrane : l'absence de résumé ou une incertitude au stade titre/résumé
  * classe la référence en 'maybe' (À vérifier sur texte intégral) plutôt qu'en exclusion abusive.
  */
@@ -2003,7 +2063,15 @@ DIRECTIVES MÉDICALES D'ÉVALUATION (3 STATUTS : included, maybe, excluded) :
 1. "excluded" : Uniquement si une cause d'inéligibilité formelle est établie avec certitude dès le titre/résumé (modèle exclusivement animal/in vitro, hors sujet manifeste, critère NOT présent, éditorial sans données originales).
 2. "maybe" (À vérifier sur texte intégral) : Principe de précaution Cochrane — si le résumé est absent ou si l'information au stade titre/résumé est insuffisante pour trancher avec certitude sur un sous-groupe ou un critère.
 3. "included" : Si la population, l'intervention/exposition et le critère concordent clairement avec le PICO.
-4. Résume de manière ultra-concise en français (max 10-12 mots) la preuve clinique dans "evidenceSnippet" ; ne remplis "exclusionReason" QUE si status === "excluded".
+4. Résume de manière ultra-concise en français (max 10-12 mots) la preuve clinique dans "evidenceSnippet".
+5. UNIQUEMENT si status === "excluded", renseigne "exclusionCategory" avec EXACTEMENT l'une de ces 7 clés PRISMA standardisées :
+   - "population" (population ou pathologie hors périmètre)
+   - "intervention" (intervention / exposition non conforme)
+   - "comparator" (comparateur non conforme)
+   - "outcome" (critère de jugement absent ou hors périmètre)
+   - "study_design" (revue narrative, éditorial, lettre, protocole sans résultats, cas clinique isolé)
+   - "preclinical" (modèle animal, in vitro ou cellulaire)
+   - "other" (autre motif d'exclusion)
 
 ARTICLES PUBMED À ÉVALUER :
 ${uncachedArticles.map((a, idx) => `
@@ -2020,6 +2088,12 @@ Réponds STRICTEMENT par un tableau JSON valide contenant exactement un objet po
     "pmid": "${uncachedArticles[0]?.pmid || '12345'}",
     "status": "included",
     "evidenceSnippet": "ECR évaluant la population cible avec résultats concordants."
+  },
+  {
+    "pmid": "99999999",
+    "status": "excluded",
+    "exclusionCategory": "preclinical",
+    "evidenceSnippet": "Étude exclusivement animale sur modèle murin."
   }
 ]`;
 
@@ -2028,7 +2102,9 @@ Réponds STRICTEMENT par un tableau JSON valide contenant exactement un objet po
   if (abortSignal?.aborted) {
     throw createAbortError();
   }
-  if (!rawResponse) return cachedResults;
+  if (!rawResponse || !rawResponse.trim()) {
+    throw new Error("Le modèle IA a renvoyé une réponse vide lors du dépouillement.");
+  }
 
   const parsed = extractJsonFromLlmResponse<unknown>(rawResponse);
   let rawItems: Array<Record<string, unknown>> = [];
@@ -2055,87 +2131,32 @@ Réponds STRICTEMENT par un tableau JSON valide contenant exactement un objet po
         normalizedPmid &&
         (normalizedStatus === 'included' || normalizedStatus === 'maybe' || normalizedStatus === 'excluded')
       ) {
+        const rawCat = typeof item.exclusionCategory === 'string' ? item.exclusionCategory.trim() : undefined;
+        const rawReason = typeof item.exclusionReason === 'string' ? item.exclusionReason.trim() : undefined;
+        const exclusionCategory =
+          normalizedStatus === 'excluded'
+            ? resolvePrismaExclusionCategory(rawCat, rawReason)
+            : undefined;
         const cleanItem: BatchScreenItemResult = {
           pmid: normalizedPmid,
           status: normalizedStatus,
-          exclusionReason: typeof item.exclusionReason === 'string' ? item.exclusionReason.trim() : undefined,
+          exclusionCategory,
+          exclusionReason:
+            normalizedStatus === 'excluded' && exclusionCategory
+              ? PRISMA_EXCLUSION_LABELS_FR[exclusionCategory]
+              : undefined,
           evidenceSnippet: typeof item.evidenceSnippet === 'string' ? item.evidenceSnippet.trim() : undefined
         };
         validFresh.push(cleanItem);
         screeningDecisionCache.set(`${normalizedPmid}::${picoFp}`, cleanItem);
       }
     }
-    return [...cachedResults, ...validFresh];
-  }
-
-  return cachedResults;
-}
-
-/**
- * AGENT DE SCREENING AUGMENTÉ : Évaluation clinique profonde d'un article PubMed (Tier 'batch')
- */
-export async function aiScreenSingleArticle(
-  article: { pmid: string; title: string; abstract: string; meshHeadings?: string[] },
-  pico: { p: string; i: string; c: string; o: string; not?: string }
-): Promise<{ status: 'included' | 'maybe' | 'excluded'; exclusionReason?: string; evidenceSnippet?: string } | null> {
-  const picoFp = computePicoFingerprint(pico);
-  const cacheKey = `${String(article.pmid).trim()}::${picoFp}`;
-  const cached = screeningDecisionCache.get(cacheKey);
-  if (cached) {
-    return {
-      status: cached.status,
-      exclusionReason: cached.exclusionReason,
-      evidenceSnippet: cached.evidenceSnippet
-    };
-  }
-
-  const prompt = `Tu es un médecin méthodologiste expert en revues systématiques (directives PRISMA 2020 et Cochrane Handbook).
-Évalue l'éligibilité de cet article PubMed pour la sélection d'une revue systématique.
-
-CRITÈRES D'ÉLIGIBILITÉ (PICO/PECO) :
-- Population cible (P) : "${pico.p}"
-- Intervention / Exposition cible (I/E) : "${pico.i}"
-- Comparateur (C) : "${pico.c || 'Non spécifié'}"
-- Critère de jugement (O) : "${pico.o || 'Non spécifié'}"
-- Critères d'exclusion formels (NOT) : "${pico.not || 'Aucun'}"
-
-ARTICLE PUBMED À ÉVALUER :
-Titre : ${article.title}
-Résumé (Abstract) :
-${compressAbstractForLlm(article.abstract, 1200)}
-Termes MeSH indexés : ${(article.meshHeadings || []).join(', ') || "Non indexé"}
-
-DIRECTIVES DE DÉCISION :
-1. "excluded" : Modèle animal/in vitro, éditorial sans données originales, ou non-conformité certaine au PICO/NOT.
-2. "maybe" : Résumé absent ou information insuffisante nécessitant la lecture du texte intégral (principe de précaution Cochrane).
-3. "included" : Conformité claire aux critères PICO.
-
-Réponds STRICTEMENT au format JSON avec cette structure :
-{
-  "status": "included" | "maybe" | "excluded",
-  "exclusionReason": "Motif médical d'exclusion en français (laisse vide si inclus ou maybe)",
-  "evidenceSnippet": "Courte justification clinique en français"
-}`;
-
-  const system = "Tu es un évaluateur clinique strict pour une revue systématique médicale. Réponds exclusivement en JSON valide.";
-  const rawResponse = await queryAiModel(prompt, system, 'batch');
-  if (!rawResponse) return null;
-
-  try {
-    const parsed = extractJsonFromLlmResponse<{ status?: string; exclusionReason?: string; evidenceSnippet?: string }>(rawResponse);
-    if (parsed && (parsed.status === 'included' || parsed.status === 'maybe' || parsed.status === 'excluded')) {
-      const result: BatchScreenItemResult = {
-        pmid: String(article.pmid).trim(),
-        status: parsed.status,
-        exclusionReason: parsed.exclusionReason || (parsed.status === 'excluded' ? "Non-conformité aux critères d'éligibilité PICO" : undefined),
-        evidenceSnippet: parsed.evidenceSnippet || (parsed.status === 'included' ? "Conforme aux critères d'éligibilité PICO." : parsed.status === 'maybe' ? "À vérifier sur texte intégral." : "Critère d'exclusion identifié.")
-      };
-      screeningDecisionCache.set(cacheKey, result);
-      return result;
+    if (validFresh.length > 0) {
+      return [...cachedResults, ...validFresh];
     }
-  } catch {}
+  }
 
-  return null;
+  throw new Error("La réponse du modèle IA n'a pas pu être interprétée comme un JSON de dépouillement valide.");
 }
 
 export interface AuditRefinementResult {
@@ -2146,47 +2167,139 @@ export interface AuditRefinementResult {
   explanation: string;
 }
 
-/**
- * Supprime les périphrases narratives d'introduction clinique (ex: "Patients en prévention secondaire après un...")
- * et les posologies chiffrées (ex: "(0,5 mg/j)", "à faible dose") pour isoler le concept médical pur.
- */
-export function stripClinicalNarrativeFraming(rawClause: string): string {
-  if (!rawClause) return "";
-  let s = rawClause.trim();
+function sanitizeAtomicConceptList(raw: unknown): NormalizedAtomicConcept[] {
+  if (!Array.isArray(raw)) return [];
+  const results: NormalizedAtomicConcept[] = [];
+  const seen = new Set<string>();
 
-  // 1. Supprimer les parenthèses purement numériques ou posologiques : ex "(0,5 mg/j)", "(> 18 ans)", "(n=120)"
-  s = s.replace(/\(\s*(?:[<>≤≥=~+-]?\s*\d+[^)]*|n\s*=\s*\d+[^)]*)\)/gi, ' ').trim();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Record<string, unknown>;
+    const conceptEn = String(obj.conceptEn || '')
+      .replace(/\[[^\]]+\]/g, '')
+      .replace(/["“”«»]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const conceptFr = String(obj.conceptFr || '')
+      .replace(/\[[^\]]+\]/g, '')
+      .replace(/["“”«»]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!conceptEn || conceptEn.length < 2) continue;
 
-  // 2. Supprimer les compléments de posologie ou voie d'administration en fin de syntagme
-  s = s.replace(/\s+(?:[àa]\s+(?:faible|forte|haute|basse|pleine)s?\s+doses?|par\s+voie\s+(?:orale|intraveineuse|sous-cutan[ée]e|parent[ée]rale)|per\s+os)\b/gi, '');
+    const dedupKey = conceptEn.toLowerCase();
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
 
-  // 3. Éplucher itérativement les préfixes narratifs de population/intervention/outcome (jusqu'à 4 passes)
-  const narrativePrefixPatterns: RegExp[] = [
-    // Préfixes de population + prévention + préposition ("Patients en prévention secondaire après un ...")
-    /^(?:(?:chez\s+(?:les|des)\s+)?(?:patients?|adultes?|sujets?|enfants?|personnes?|femmes?|hommes?|individus?|population|participants?)\s+(?:adultes?\s+|âg[ée]s?\s+|p[ée]diatriques?\s+)?)?(?:en\s+pr[ée]vention\s+(?:primaire|secondaire|tertiaire)\s+(?:apr[èe]s|post[\s-]*|suite\s+[àa]|d['’]|de\s+l['’]|du|de\s+la|des|pour)\s+(?:un[e]?\s+|des\s+|l['’])?)/i,
-    // Préfixes de population génériques suivis d'un participe ou préposition ("Patients adultes atteints de ...", "Patients ayant présenté un ...")
-    /^(?:chez\s+(?:les|des)\s+)?(?:patients?|adultes?|sujets?|enfants?|personnes?|femmes?|hommes?|individus?|population|participants?)\s+(?:adultes?\s+|âg[ée]s?\s+|p[ée]diatriques?\s+)?(?:atteints?\s+(?:de|d['’]|du|de\s+la|des)\s*|souffrant\s+(?:de|d['’]|du|de\s+la|des)\s*|pr[ée]sentant\s+(?:un[e]?\s+|des\s+|l['’])?|ayant\s+(?:pr[ée]sent[ée]|eu|subi|fait)\s+(?:un[e]?\s+|des\s+|l['’])?|hospitalis[ée]s?\s+pour\s+(?:un[e]?\s+|des\s+|l['’])?|pris\s+en\s+charge\s+pour\s+(?:un[e]?\s+|des\s+|l['’])?|trait[ée]s?\s+(?:par|pour)\s+(?:un[e]?\s+|des\s+|l['’])?|avec\s+(?:un[e]?\s+|des\s+|l['’])?|en\s+(?=surpoids|ob[ée]sit[ée]|insuffisance|choc|r[ée]mission|phase)|apr[èe]s\s+(?:un[e]?\s+|des\s+|l['’])?|suite\s+[àa]\s+(?:un[e]?\s+|des\s+|l['’])?|post[\s-]+(?=[a-zàâäéèêëîïôöùûüç]{4}))/i,
-    // Préfixes d'intervention ou de critère de jugement ("Traitement par ...", "Évaluation de ...")
-    /^(?:traitement\s+par\s+|administration\s+(?:de|d['’]|du|des)\s*|prise\s+en\s+charge\s+par\s+|th[ée]rapie\s+par\s+|suppl[ée]mentation\s+en\s+|[ée]valuation\s+(?:de|d['’]|du|de\s+la|des)\s*|mesure\s+(?:de|d['’]|du|de\s+la|des)\s*|incidence\s+(?:de|d['’]|du|de\s+la|des)\s*|risque\s+(?:de|d['’]|du|de\s+la|des)\s*|survenue\s+(?:de|d['’]|du|de\s+la|des)\s*)/i,
-    // Prépositions d'antécédent isolées en début de second membre ("... ou après un syndrome coronarien aigu")
-    /^(?:apr[èe]s\s+(?:un[e]?\s+|des\s+|l['’])?|suite\s+[àa]\s+(?:un[e]?\s+|des\s+|l['’])?)/i,
-    // Articles résiduels en début de syntagme ("un syndrome coronarien aigu" -> "syndrome coronarien aigu")
-    /^(?:un[e]?\s+|des\s+|le\s+|la\s+|les\s+|l['’]|du\s+|de\s+la\s+|de\s+l['’]|d['’])/i
-  ];
+    const rawSyns = Array.isArray(obj.synonymsTiab) ? obj.synonymsTiab : [];
+    const synonymsTiab = Array.from(
+      new Set(
+        rawSyns
+          .map((s) =>
+            String(s || '')
+              .replace(/\[[^\]]+\]/g, '')
+              .replace(/["“”«»*]/g, '')
+              .replace(/\s+/g, ' ')
+              .trim()
+          )
+          .filter((s) => s.length >= 2)
+      )
+    ).slice(0, 6);
 
-  for (let pass = 0; pass < 4; pass++) {
-    let changed = false;
-    for (const pat of narrativePrefixPatterns) {
-      const next = s.replace(pat, '').trim();
-      if (next && next.length >= 2 && next !== s) {
-        s = next;
-        changed = true;
-      }
-    }
-    if (!changed) break;
+    results.push({
+      conceptFr: conceptFr || conceptEn,
+      conceptEn,
+      synonymsTiab
+    });
   }
 
-  return s.replace(/\s+/g, ' ').trim();
+  return results;
+}
+
+/**
+ * Normalise directement chaque axe PICO/PECO actif en concepts biomédicaux atomiques
+ * (`{ conceptFr, conceptEn, synonymsTiab }`) via le modèle rapide configuré :
+ * - `conceptFr` court (1 à 4 mots) pour l'interrogation officielle HeTOP / CISMeF
+ * - `conceptEn` en anglais pour la validation officielle NCBI Entrez (`db=mesh`)
+ * - `synonymsTiab` pour les variantes texte libre `[tiab]`
+ */
+export async function aiNormalizePicoConcepts(
+  axes: ReadonlyArray<{ readonly key: 'p' | 'i' | 'c' | 'o' | 'not'; readonly text: string }>
+): Promise<NormalizedPicoConceptsMap> {
+  const activeAxes = (axes || []).filter((a) => a.text && a.text.trim().length > 0);
+  if (activeAxes.length === 0) return {};
+
+  const axesBlock = activeAxes
+    .map((a) => `- ${a.key.toUpperCase()} : "${a.text.trim()}"`)
+    .join('\n');
+
+  const system = `Tu es un médecin méthodologiste expert du thésaurus NLM MeSH, d'HeTOP/CISMeF et du Cochrane Handbook.
+Décompose chaque axe PICO/PECO fourni en concepts biomédicaux atomiques prêts pour la validation officielle HeTOP (français court) et NCBI Entrez db=mesh (anglais).
+Règles méthodologiques PRISMA / Cochrane impératives :
+1. Pour chaque concept atomique, renvoie :
+   - "conceptFr" : terme médical français court (1 à 4 mots maximum, sans phrase narrative ni posologie) adapté à HeTOP.
+   - "conceptEn" : concept biomédical anglais canonique (sans balises [Mesh]/[tiab] ni opérateurs booléens) adapté à NCBI Entrez.
+   - "synonymsTiab" : 1 à 5 synonymes ou abréviations anglaises utiles en texte libre [tiab].
+2. Axes I (Intervention/Exposition) et C (Comparateur) : extrais UNIQUEMENT la substance active, le produit biologique, le dispositif ou la procédure spécifique. N'émets JAMAIS un concept séparé pour une simple voie d'administration ou un terme générique (ex. pas de "Injections, Intra-Articular", "Oral Administration", "Therapeutics", "Treatment", "Therapy" ou "Pharmaceutical Preparations") qui polluerait le bloc OR.
+3. Axe O (Outcome) : sépare chaque critère de jugement distinct en un concept atomique dédié (ex. douleur vs fonction articulaire).
+4. Ne mets jamais de balises techniques ([Mesh], [tiab], *) ni d'opérateurs AND/OR dans les chaînes.
+Réponds EXCLUSIVEMENT en JSON valide.`;
+
+  const prompt = `Normalise les axes PICO/PECO suivants au format JSON strict :
+${axesBlock}
+
+Format JSON attendu (inclure uniquement les clés d'axes fournies ci-dessus) :
+{
+  "p": [
+    { "conceptFr": "terme français court", "conceptEn": "Canonical English Concept", "synonymsTiab": ["english synonym 1", "abbreviation"] }
+  ],
+  "i": [
+    { "conceptFr": "substance ou procédure spécifique", "conceptEn": "Specific Active Concept", "synonymsTiab": ["synonym 1", "abbrev"] }
+  ],
+  "o": [
+    { "conceptFr": "critère 1", "conceptEn": "Outcome 1", "synonymsTiab": ["synonym 1"] }
+  ]
+}`;
+
+  const rawResponse = await queryAiModel(prompt, system, 'fast');
+  if (!rawResponse || !rawResponse.trim()) {
+    throw new Error("Le modèle IA a renvoyé une réponse vide lors de la normalisation des concepts MeSH.");
+  }
+
+  const parsed = extractJsonFromLlmResponse<Record<string, unknown>>(rawResponse);
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error("La réponse de normalisation des concepts par l'IA n'est pas un JSON valide.");
+  }
+
+  const output: Record<'p' | 'i' | 'c' | 'o' | 'not', NormalizedAtomicConcept[]> = {
+    p: [],
+    i: [],
+    c: [],
+    o: [],
+    not: []
+  };
+
+  let totalNormalized = 0;
+  for (const axis of activeAxes) {
+    const rawList = parsed[axis.key] ?? parsed[axis.key.toUpperCase()];
+    const cleanList = sanitizeAtomicConceptList(rawList);
+    if (cleanList.length > 0) {
+      output[axis.key] = cleanList;
+      totalNormalized += cleanList.length;
+    }
+  }
+
+  if (totalNormalized === 0) {
+    throw new Error("Aucun concept biomédical exploitable n'a pu être extrait par le modèle IA.");
+  }
+
+  const result: Partial<Record<'p' | 'i' | 'c' | 'o' | 'not', readonly NormalizedAtomicConcept[]>> = {};
+  for (const axis of activeAxes) {
+    if (output[axis.key].length > 0) {
+      result[axis.key] = output[axis.key];
+    }
+  }
+  return result;
 }
 
 /**
@@ -2312,7 +2425,7 @@ Propose une version optimisée du PICO et de l'activation des axes pour répondr
 RÈGLES STRICTES :
 1. Rédige les champs 'refinedPico' UNIQUEMENT en langage médical naturel français (sigles développés, SANS balises [Mesh]/[TiAb]/[pt], SANS opérateurs AND/OR/NOT).
 2. INTERDICTION STRICTE d'activer un axe C (comparateur passif) ou un axe NOT que l'utilisateur a laissé désactivé (Actif: false), SAUF en cas de bruit bibliographique manifeste explicitement signalé dans les recommandations d'audit.
-3. Pour chaque axe actif modifié ou conservé, fournis dans "englishCoreTerms" 1 à 4 concepts anglais NLM concis candidats à la validation NCBI Entrez (db=mesh), afin de préserver une résolution MeSH exacte.
+3. Pour chaque axe actif modifié ou conservé, fournis dans "atomicConcepts" les concepts biomédicaux atomiques normalisés ({ conceptFr court 1-4 mots pour HeTOP, conceptEn en anglais pour NCBI Entrez, synonymsTiab pour le texte libre }) et dans "englishCoreTerms" les concepts anglais correspondants. Sur les axes I et C, extrais UNIQUEMENT la substance active, le dispositif ou la procédure spécifique (sans émettre de concept séparé pour une simple voie d'administration ou un terme générique comme Therapeutics/Treatment). Sur O, sépare chaque critère distinct.
 
 Réponds STRICTEMENT au format JSON avec cette structure :
 {
@@ -2330,6 +2443,13 @@ Réponds STRICTEMENT au format JSON avec cette structure :
     "o": true,
     "not": false
   },
+  "atomicConcepts": {
+    "p": [{ "conceptFr": "terme court", "conceptEn": "English Concept", "synonymsTiab": ["synonym 1"] }],
+    "i": [{ "conceptFr": "substance ou procédure", "conceptEn": "Active Concept", "synonymsTiab": ["synonym 1"] }],
+    "c": [],
+    "o": [{ "conceptFr": "critère 1", "conceptEn": "Outcome 1", "synonymsTiab": ["synonym 1"] }],
+    "not": []
+  },
   "englishCoreTerms": {
     "p": ["English Descriptor 1"],
     "i": ["English Descriptor 2"],
@@ -2342,24 +2462,35 @@ Réponds STRICTEMENT au format JSON avec cette structure :
 }`;
 
   const rawResponse = await queryAiModel(prompt, AUDIT_AGENT_SYSTEM_PROMPT, 'reasoning');
-  if (!rawResponse) return null;
+  if (!rawResponse || !rawResponse.trim()) {
+    throw new Error("Le modèle IA a renvoyé une réponse vide lors de la suggestion d'affinage PICO.");
+  }
 
-  try {
-    const parsed = extractJsonFromLlmResponse<{
-      refinedPico?: { p?: string; i?: string; c?: string; o?: string; not?: string };
-      activePico?: { p?: boolean; i?: boolean; c?: boolean; o?: boolean; not?: boolean };
-      englishCoreTerms?: {
-        p?: unknown;
-        i?: unknown;
-        c?: unknown;
-        o?: unknown;
-        not?: unknown;
-      };
-      strategy?: 'sensitive' | 'balanced' | 'specific';
-      explanation?: string;
-    }>(rawResponse);
-    if (parsed && parsed.refinedPico) {
-      const pRefined = sanitizePicoConcept(parsed.refinedPico.p || pico.p);
+  const parsed = extractJsonFromLlmResponse<{
+    refinedPico?: { p?: string; i?: string; c?: string; o?: string; not?: string };
+    activePico?: { p?: boolean; i?: boolean; c?: boolean; o?: boolean; not?: boolean };
+    atomicConcepts?: {
+      p?: unknown;
+      i?: unknown;
+      c?: unknown;
+      o?: unknown;
+      not?: unknown;
+    };
+    englishCoreTerms?: {
+      p?: unknown;
+      i?: unknown;
+      c?: unknown;
+      o?: unknown;
+      not?: unknown;
+    };
+    strategy?: 'sensitive' | 'balanced' | 'specific';
+    explanation?: string;
+  }>(rawResponse);
+  if (!parsed || !parsed.refinedPico) {
+    throw new Error("La suggestion d'affinage PICO renvoyée par l'IA n'est pas un JSON valide.");
+  }
+
+  const pRefined = sanitizePicoConcept(parsed.refinedPico.p || pico.p);
       let iRefined = sanitizePicoConcept(parsed.refinedPico.i || pico.i);
       const cRefined = sanitizePicoConcept(parsed.refinedPico.c ?? pico.c);
       const oRefined = stripIatrogenicTermsFromOutcome(
@@ -2448,10 +2579,21 @@ Réponds STRICTEMENT au format JSON avec cette structure :
         // Fusion par union des englishCoreTerms de V1 pour empêcher l'effondrement de couverture en V2
         for (const h of preservedHints) pushUnique(h);
 
+        const parsedAtomics = sanitizeAtomicConceptList(parsed.atomicConcepts?.[axisKey]);
+        const preservedAtomics = currentQualifications?.[axisKey]?.atomicConcepts;
+        const atomicConcepts =
+          parsedAtomics.length > 0
+            ? parsedAtomics
+            : isUnchanged && preservedAtomics && preservedAtomics.length > 0
+              ? preservedAtomics
+              : undefined;
+
         const englishCoreTerms =
           unionHints.length > 0
             ? unionHints.slice(0, 8)
-            : deterministic.englishCoreTerms;
+            : atomicConcepts && atomicConcepts.length > 0
+              ? atomicConcepts.map((c) => c.conceptEn)
+              : deterministic.englishCoreTerms;
 
         return {
           axisRole: deterministic.axisRole,
@@ -2460,7 +2602,8 @@ Réponds STRICTEMENT au format JSON avec cette structure :
               ? currentQualifications[axisKey]!.impliedSubheadings
               : deterministic.impliedSubheadings,
           coreClinicalConcept: deterministic.coreClinicalConcept,
-          englishCoreTerms
+          englishCoreTerms,
+          ...(atomicConcepts ? { atomicConcepts } : {})
         };
       };
 
@@ -2493,89 +2636,6 @@ Réponds STRICTEMENT au format JSON avec cette structure :
         explanation:
           parsed.explanation || "Stratégie optimisée selon les recommandations de l'audit qualité."
       };
-    }
-  } catch {}
-
-  return null;
-}
-
-/**
- * Optimisation directe de la syntaxe de l'équation de recherche par l'IA
- * SANS modifier les champs PICO de l'utilisateur.
- */
-export async function aiCleanAndOptimizeQuery(
-  currentQuery: string,
-  critiqueReport?: { observations?: readonly AuditObservationEntry[]; recommendations?: readonly string[] }
-): Promise<string | null> {
-  const observationsText = normalizeAuditObservations(critiqueReport?.observations || [])
-    .map(o => `- [${o.severity.toUpperCase()}] ${o.text}`)
-    .join('\n');
-  const recommendationsText = (critiqueReport?.recommendations || []).map(r => `- ${r}`).join('\n');
-
-  const prompt = `Tu es un expert mondial en syntaxe documentaire PubMed/MEDLINE pour les revues systématiques (PRISMA 2020 / Cochrane).
-Voici l'équation de recherche PubMed actuelle :
-${currentQuery}
-
-${observationsText ? `OBSERVATIONS DE L'AUDIT :\n${observationsText}\n` : ''}
-${recommendationsText ? `RECOMMANDATIONS MÉTHODOLOGIQUES :\n${recommendationsText}\n` : ''}
-
-MISSION DE NETTOYAGE TECHNIQUE DE L'ÉQUATION :
-1. Corrige toute erreur de syntaxe PubMed (guillemets imbriqués, doubles guillemets "", balises [TiAb] ou [Mesh] mal placées ou doublées à l'extérieur des parenthèses).
-2. Supprime les termes parasites ou hors-sujet identifiés par l'audit (ex: faux-amis comme "hunger strike", troncatures trop courtes générant du bruit).
-3. Assure-toi que les parenthèses booléennes sont rigoureusement équilibrées (AND entre les blocs majeurs, OR au sein de chaque bloc).
-4. Respecte scrupuleusement la question clinique initiale.
-
-Réponds STRICTEMENT au format JSON avec cette structure :
-{
-  "cleanedQuery": "L'équation PubMed corrigée prête à l'emploi"
-}`;
-
-  const system = "Tu es un spécialiste de la syntaxe PubMed. Réponds exclusivement en JSON valide contenant la clé cleanedQuery.";
-  const rawResponse = await queryAiModel(prompt, system, 'reasoning');
-  if (!rawResponse) return null;
-
-  const parsed = extractJsonFromLlmResponse<{ cleanedQuery?: string }>(rawResponse);
-  if (parsed?.cleanedQuery && typeof parsed.cleanedQuery === 'string' && parsed.cleanedQuery.trim().length > 0) {
-    return parsed.cleanedQuery.trim();
-  }
-
-  let cleaned = rawResponse.trim();
-  if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```[a-zA-Z]*\n?/, '').replace(/\n?```$/, '').trim();
-  }
-  return cleaned || null;
-}
-
-const meshSuggestionCache = new Map<string, string[]>();
-
-/**
- * Traduit un concept médical en descripteurs MeSH NLM anglophones candidats via l'IA active,
- * utilisé en secours lorsque les traducteurs lexicaux classiques échouent à résoudre un descripteur NLM.
- */
-export async function aiSuggestMeshCandidates(concept: string): Promise<string[]> {
-  const clean = concept.trim();
-  if (!clean) return [];
-  const cacheKey = clean.toLowerCase();
-  if (meshSuggestionCache.has(cacheKey)) {
-    return meshSuggestionCache.get(cacheKey)!;
-  }
-
-  const config = getAiConfig();
-  if (config.provider === 'deterministic') return [];
-
-  const prompt = `Concept clinique : "${clean}". Donne 1 à 2 descripteurs MeSH NLM officiels en anglais (ex: "Diet", "Overweight"). Réponds en JSON : {"candidates": ["MeSH 1"]}`;
-  const system = "Expert NLM MeSH. Réponds uniquement en JSON valide.";
-  try {
-    const raw = await queryAiModel(prompt, system, 'batch');
-    if (!raw) return [];
-    const parsed = extractJsonFromLlmResponse<{ candidates?: string[] }>(raw);
-    if (parsed && Array.isArray(parsed.candidates)) {
-      const list = parsed.candidates.map(c => String(c).trim()).filter(Boolean);
-      meshSuggestionCache.set(cacheKey, list);
-      return list;
-    }
-  } catch {}
-  return [];
 }
 
 export type StudyDesignType = 'rct' | 'observational' | 'review' | 'other';
@@ -2685,98 +2745,6 @@ export function computeCochraneOverallRating(
 }
 
 /**
- * Pré-évaluation déterministe Cochrane RoB 2 / ROBINS-I / AMSTAR 2 basée sur l'analyse lexicale
- * du titre et du résumé (utilisée en mode Règles PRISMA ou en secours si un article du lot est omis par le LLM).
- * Respecte la règle stricte Cochrane : tout domaine non explicitement documenté dans l'abstract = 'moderate'.
- */
-export function evaluateArticleRoB2Deterministic(
-  article: { pmid: string; title: string; abstract: string; publicationTypes?: readonly string[] },
-  evaluatedByLabel = 'Règles méthodologiques Cochrane (Analyse du résumé)'
-): Rob2ArticleEvaluation {
-  const pmid = String(article.pmid).trim();
-  const title = article.title || '';
-  const abstract = article.abstract || '';
-  const combined = `${title} ${abstract}`.toLowerCase();
-  const studyDesign = inferStudyDesignFromText(title, abstract, article.publicationTypes);
-
-  // D1 : Randomisation / Sélection / Confusion
-  let d1: 'low' | 'moderate' | 'high' = 'moderate';
-  if (/\b(?:computer-generated|allocation\s+concealment|block\s+randomi[sz]ation|stratified\s+randomi[sz]ation|propensity\s+score|multivariable\s+adjusted)\b/.test(combined)) {
-    d1 = 'low';
-  } else if (studyDesign === 'observational' && /\b(?:unadjusted|case\s+series|retrospective\s+chart)\b/.test(combined)) {
-    d1 = 'high';
-  }
-
-  // D2 : Déviations / Insu (Blinding)
-  let d2: 'low' | 'moderate' | 'high' = 'moderate';
-  if (/\b(?:double-blind|double\s+blind|triple-blind|placebo-controlled)\b/.test(combined)) {
-    d2 = 'low';
-  } else if (/\b(?:open-label|open\s+label|unblinded)\b/.test(combined) && /\b(?:non-adherence|crossover\s+contamination)\b/.test(combined)) {
-    d2 = 'high';
-  }
-
-  // D3 : Données manquantes / Attrition (ITT)
-  let d3: 'low' | 'moderate' | 'high' = 'moderate';
-  if (/\b(?:intention-to-treat|intent-to-treat|\bitt\b|complete\s+follow-up|no\s+loss\s+to\s+follow-up)\b/.test(combined)) {
-    d3 = 'low';
-  } else if (/\b(?:high\s+dropout|high\s+attrition|per-protocol\s+only)\b/.test(combined)) {
-    d3 = 'high';
-  }
-
-  // D4 : Mesure du critère de jugement
-  let d4: 'low' | 'moderate' | 'high' = 'moderate';
-  if (/\b(?:body\s+weight|bmi|mortality|blood\s+markers|hormones|biochemical|blinded\s+assessor|laboratory|fecal\s+microbiota|liver)\b/.test(combined)) {
-    d4 = 'low';
-  } else if (/\b(?:self-reported|subjective\s+questionnaire)\b/.test(combined) && !/\b(?:double-blind)\b/.test(combined)) {
-    d4 = 'high';
-  }
-
-  // D5 : Sélection du résultat rapporté (Enregistrement NCT / PROSPERO)
-  let d5: 'low' | 'moderate' | 'high' = 'moderate';
-  if (/\b(?:nct\d{6,10}|isrctn\d+|prospero|crd\d+|eudract|registered\s+at\s+clinicaltrials)\b/.test(combined)) {
-    d5 = 'low';
-  }
-
-  const overall = computeCochraneOverallRating(d1, d2, d3, d4, d5);
-
-  const notes: string[] = [];
-  if (studyDesign === 'rct') notes.push('Essai contrôlé randomisé');
-  else if (studyDesign === 'review') notes.push('Revue systématique');
-  else if (studyDesign === 'observational') notes.push('Étude observationnelle');
-  else notes.push('Revue narrative / Recommandation / Autre format');
-
-  if (d2 === 'low') notes.push('double-insu documenté');
-  else notes.push('insu non documenté dans le résumé (coté Modéré par précaution Cochrane)');
-
-  if (d4 === 'low') notes.push('critère de jugement objectif/biologique');
-  if (d5 === 'low') notes.push('protocole enregistré');
-
-  return {
-    pmid,
-    d1,
-    d2,
-    d3,
-    d4,
-    d5,
-    overall,
-    studyDesign,
-    justification: `${notes.join(', ')}.`,
-    evaluatedBy: evaluatedByLabel
-  };
-}
-
-/**
- * Évalue le risque de biais d'une étude incluse selon les 5 domaines Cochrane RoB 2 / ROBINS-I
- * avec règle stricte anti-hallucination sur résumé (tout élément non documenté dans l'abstract = "moderate").
- */
-export async function aiEvaluateArticleRoB2(
-  article: { pmid: string; title: string; abstract: string; publicationTypes?: readonly string[] }
-): Promise<Rob2ArticleEvaluation | null> {
-  const batchRes = await aiEvaluateBatchRoB2([article]);
-  return batchRes.get(String(article.pmid)) || null;
-}
-
-/**
  * Sélectionne strictement les études éligibles non encore évaluées pour le pré-repérage des biais :
  * - exclut toute étude déjà évaluée (manuelle ou IA) afin de ne jamais écraser un travail existant,
  * - exclut les formats de type `'other'` (revues narratives, recommandations, éditoriaux, cas cliniques).
@@ -2803,6 +2771,7 @@ export function selectUnassessedRobBatch<
  * Pré-évaluation par lots (Batch) du risque de biais Cochrane RoB 2 / ROBINS-I.
  * Permet d'évaluer jusqu'à 20 études incluses en 1 seul appel API (évite les erreurs HTTP 429).
  * Prend en charge l'interruption immédiate via `abortSignal`.
+ * Règle stricte sur résumé : tout élément non documenté dans l'abstract = "moderate".
  */
 export async function aiEvaluateBatchRoB2(
   articles: ReadonlyArray<{ pmid: string; title: string; abstract: string; publicationTypes?: readonly string[] }>,
@@ -2816,17 +2785,6 @@ export async function aiEvaluateBatchRoB2(
   if (!articles || articles.length === 0) return resultMap;
 
   const aiConfig = getAiConfig();
-  if (aiConfig.provider === 'deterministic') {
-    for (const art of articles) {
-      if (abortSignal?.aborted) {
-        throw createAbortError();
-      }
-      const det = evaluateArticleRoB2Deterministic(art);
-      resultMap.set(det.pmid, det);
-    }
-    return resultMap;
-  }
-
   const evaluatedBy = getActiveProviderLabel(aiConfig, 'batch');
 
   const articlesPayload = articles.map((art, idx) => {
@@ -2845,7 +2803,7 @@ Analyse le lot de ${articles.length} étude(s) ci-dessous à partir de leur titr
 LOT D'ÉTUDES À ÉVALUER :
 ${articlesPayload}
 
-RÈGLES MÉTHODOLOGIQUES STRICTES (ANTI-HALLUCINATION SUR RÉSUMÉ) :
+RÈGLES MÉTHODOLOGIQUES STRICTES (PRUDENCE SUR RÉSUMÉ) :
 1. INTERDICTION D'INVENTER UN FAIBLE RISQUE ("low") SANS PREUVE TEXTUELLE : Un résumé PubMed est court. Si un domaine n'est PAS explicitement documenté dans le résumé, tu DOIS impérativement le coter "moderate" ("Préoccupations / À vérifier sur texte intégral") et JAMAIS "low".
 2. Critères de cotation par domaine :
    - D1 (Randomisation / Confusion) : "low" uniquement si randomisation explicite (et séquence/dissimulation mentionnée) ; "moderate" si randomisé sans détail d'assignation ; "high" si non randomisé ou biais de sélection manifeste.
@@ -2875,78 +2833,80 @@ Réponds STRICTEMENT au format JSON sous forme d'un tableau d'objets :
   if (abortSignal?.aborted) {
     throw createAbortError();
   }
-
-  if (rawResponse) {
-    const validRatings = ['low', 'moderate', 'high'];
-    const safeRating = (val: unknown): 'low' | 'moderate' | 'high' => {
-      const normalized = String(val || '').toLowerCase().trim();
-      return validRatings.includes(normalized) ? (normalized as 'low' | 'moderate' | 'high') : 'moderate';
-    };
-    const safeDesign = (val: unknown, fallback: StudyDesignType): StudyDesignType => {
-      const normalized = String(val || '').toLowerCase().trim();
-      return ['rct', 'observational', 'review', 'other'].includes(normalized)
-        ? (normalized as StudyDesignType)
-        : fallback;
-    };
-
-    const parsed = extractJsonFromLlmResponse<unknown>(rawResponse);
-    let items: Array<Record<string, unknown>> = [];
-    if (Array.isArray(parsed)) {
-      items = parsed as Array<Record<string, unknown>>;
-    } else if (parsed && typeof parsed === 'object') {
-      const obj = parsed as Record<string, unknown>;
-      if (Array.isArray(obj.evaluations)) items = obj.evaluations as Array<Record<string, unknown>>;
-      else if (Array.isArray(obj.results)) items = obj.results as Array<Record<string, unknown>>;
-      else if (Array.isArray(obj.studies)) items = obj.studies as Array<Record<string, unknown>>;
-      else if ('d1' in obj) items = [obj];
-    }
-
-    for (let idx = 0; idx < items.length; idx++) {
-      const item = items[idx];
-      const rawPmid = String(item?.pmid || '').replace(/\D+/g, '').trim();
-      const matchedArticle =
-        articles.find(a => String(a.pmid).trim() === rawPmid) ||
-        (items.length === articles.length ? articles[idx] : undefined) ||
-        (articles.length === 1 ? articles[0] : undefined);
-
-      if (!matchedArticle) continue;
-      const pmid = String(matchedArticle.pmid).trim();
-      const fallbackDesign = inferStudyDesignFromText(
-        matchedArticle.title || '',
-        matchedArticle.abstract || '',
-        matchedArticle.publicationTypes
-      );
-
-      const d1 = safeRating(item.d1);
-      const d2 = safeRating(item.d2);
-      const d3 = safeRating(item.d3);
-      const d4 = safeRating(item.d4);
-      const d5 = safeRating(item.d5);
-      const overall = computeCochraneOverallRating(d1, d2, d3, d4, d5);
-
-      resultMap.set(pmid, {
-        pmid,
-        d1,
-        d2,
-        d3,
-        d4,
-        d5,
-        overall,
-        studyDesign: safeDesign(item.studyDesign, fallbackDesign),
-        justification: typeof item.justification === 'string' && item.justification.trim().length > 0
-          ? item.justification.trim()
-          : "Pré-évaluation sur résumé (domaines non documentés cotés 'Modéré' à vérifier sur texte intégral)",
-        evaluatedBy
-      });
-    }
+  if (!rawResponse || !rawResponse.trim()) {
+    throw new Error("Le modèle IA a renvoyé une réponse vide lors de l'évaluation du risque de biais.");
   }
 
-  // Garantie de complétude : tout article du lot non couvert par la réponse LLM reçoit l'évaluation déterministe Cochrane
-  for (const art of articles) {
-    const key = String(art.pmid).trim();
-    if (!resultMap.has(key)) {
-      resultMap.set(key, evaluateArticleRoB2Deterministic(art));
-    }
+  const validRatings = ['low', 'moderate', 'high'];
+  const safeRating = (val: unknown): 'low' | 'moderate' | 'high' => {
+    const normalized = String(val || '').toLowerCase().trim();
+    return validRatings.includes(normalized) ? (normalized as 'low' | 'moderate' | 'high') : 'moderate';
+  };
+  const safeDesign = (val: unknown, fallback: StudyDesignType): StudyDesignType => {
+    const normalized = String(val || '').toLowerCase().trim();
+    return ['rct', 'observational', 'review', 'other'].includes(normalized)
+      ? (normalized as StudyDesignType)
+      : fallback;
+  };
+
+  const parsed = extractJsonFromLlmResponse<unknown>(rawResponse);
+  let items: Array<Record<string, unknown>> = [];
+  if (Array.isArray(parsed)) {
+    items = parsed as Array<Record<string, unknown>>;
+  } else if (parsed && typeof parsed === 'object') {
+    const obj = parsed as Record<string, unknown>;
+    if (Array.isArray(obj.evaluations)) items = obj.evaluations as Array<Record<string, unknown>>;
+    else if (Array.isArray(obj.results)) items = obj.results as Array<Record<string, unknown>>;
+    else if (Array.isArray(obj.studies)) items = obj.studies as Array<Record<string, unknown>>;
+    else if ('d1' in obj) items = [obj];
+  }
+
+  for (let idx = 0; idx < items.length; idx++) {
+    const item = items[idx];
+    const rawPmid = String(item?.pmid || '').replace(/\D+/g, '').trim();
+    const matchedArticle =
+      articles.find(a => String(a.pmid).trim() === rawPmid) ||
+      (items.length === articles.length ? articles[idx] : undefined) ||
+      (articles.length === 1 ? articles[0] : undefined);
+
+    if (!matchedArticle) continue;
+    const pmid = String(matchedArticle.pmid).trim();
+    const fallbackDesign = inferStudyDesignFromText(
+      matchedArticle.title || '',
+      matchedArticle.abstract || '',
+      matchedArticle.publicationTypes
+    );
+
+    const d1 = safeRating(item.d1);
+    const d2 = safeRating(item.d2);
+    const d3 = safeRating(item.d3);
+    const d4 = safeRating(item.d4);
+    const d5 = safeRating(item.d5);
+    const overall = computeCochraneOverallRating(d1, d2, d3, d4, d5);
+
+    resultMap.set(pmid, {
+      pmid,
+      d1,
+      d2,
+      d3,
+      d4,
+      d5,
+      overall,
+      studyDesign: safeDesign(item.studyDesign, fallbackDesign),
+      justification: typeof item.justification === 'string' && item.justification.trim().length > 0
+        ? item.justification.trim()
+        : "Pré-évaluation sur résumé (domaines non documentés cotés 'Modéré' à vérifier sur texte intégral)",
+      evaluatedBy
+    });
+  }
+
+  if (resultMap.size === 0) {
+    throw new Error("La réponse du modèle IA n'a pas pu être interprétée comme un JSON RoB 2 valide.");
+  }
+  if (resultMap.size < articles.length) {
+    throw new Error(
+      `Évaluation du risque de biais incomplète : ${resultMap.size} / ${articles.length} étude(s) couverte(s) par le modèle IA.`
+    );
   }
 
   return resultMap;

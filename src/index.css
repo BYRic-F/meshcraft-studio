@@ -40,15 +40,6 @@ body {
   border-color: #cbd5e1;
 }
 
-/* Alias préservé pour les modales existantes */
-.glass-panel {
-  background: #0f172a;
-  border: 1px solid #1e293b;
-  border-radius: 0.875rem;
-  box-shadow: 
-    0 4px 20px 0 rgba(15, 23, 42, 0.25);
-}
-
 /* Coloration Syntaxique Académique & Lisible */
 .syn-mesh { 
   color: #4f46e5; 

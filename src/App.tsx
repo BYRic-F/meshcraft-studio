@@ -156,6 +156,9 @@ function MeSHcraftStudioShell() {
       setHydratedQuery('');
       setCurrentStep(6);
       setWizardStep(2);
+      if (result.critiqueReport?.auditError) {
+        setErrorBanner(result.critiqueReport.auditError);
+      }
     } catch (err: unknown) {
       setErrorBanner(mapErrorToUserMessage(err));
     } finally {
@@ -285,49 +288,70 @@ function MeSHcraftStudioShell() {
 
       let updatedCritique: CritiqueReport = pressReport;
       const aiConfig = getAiConfig();
-      if (aiConfig.provider !== 'deterministic') {
-        try {
-          const sampleTitles = (live.articles || []).map(a => a.title).filter(Boolean);
-          const descriptorsList = (effectiveBlocks || [])
-            .map((b: MappedBlock) => b.descriptor)
-            .filter(Boolean);
-          const effectiveAuditPico: PicoInputs = {
-            p: activeBlocks.p ? picoInputs.p : '',
-            i: activeBlocks.i ? picoInputs.i : '',
-            c: activeBlocks.c ? picoInputs.c : '',
-            o: activeBlocks.o ? picoInputs.o : '',
-            not: activeBlocks.not ? (picoInputs.not || '') : ''
-          };
-          const critique = await aiAuditAndCritiqueQuery(
-            effectiveAuditPico,
-            newQuery,
-            descriptorsList,
+      try {
+        const sampleTitles = (live.articles || []).map(a => a.title).filter(Boolean);
+        const descriptorsList = (effectiveBlocks || [])
+          .map((b: MappedBlock) => b.descriptor)
+          .filter(Boolean);
+        const effectiveAuditPico: PicoInputs = {
+          p: activeBlocks.p ? picoInputs.p : '',
+          i: activeBlocks.i ? picoInputs.i : '',
+          c: activeBlocks.c ? picoInputs.c : '',
+          o: activeBlocks.o ? picoInputs.o : '',
+          not: activeBlocks.not ? (picoInputs.not || '') : ''
+        };
+        const critique = await aiAuditAndCritiqueQuery(
+          effectiveAuditPico,
+          newQuery,
+          descriptorsList,
+          live.count,
+          sampleTitles,
+          undefined,
+          live.stratifiedSample
+        );
+        if (critique) {
+          const finalized = finalizePressStatus(
+            pressReport,
+            critique.observations,
             live.count,
-            sampleTitles,
-            undefined,
-            live.stratifiedSample
+            false
           );
-          if (critique) {
-            const finalized = finalizePressStatus(
-              pressReport,
-              critique.observations,
-              live.count,
-              false
-            );
-            updatedCritique = {
-              score: pressReport.score,
-              pressBreakdown: pressReport.pressBreakdown,
-              pressStatus: finalized.pressStatus,
-              pressAlertCount: finalized.pressAlertCount,
-              observations: critique.observations,
-              recommendations: critique.recommendations,
-              source: aiConfig.provider,
-              evaluatorModel: resolveActiveModelForTask(aiConfig, 'reasoning')
-            };
-          }
-        } catch {
-          // Non-blocking qualitative audit update
+          updatedCritique = {
+            score: pressReport.score,
+            pressBreakdown: pressReport.pressBreakdown,
+            pressStatus: finalized.pressStatus,
+            pressAlertCount: finalized.pressAlertCount,
+            observations: critique.observations,
+            recommendations: critique.recommendations,
+            source: aiConfig.provider,
+            evaluatorModel: resolveActiveModelForTask(aiConfig, 'reasoning')
+          };
         }
+      } catch (auditErrRaw: unknown) {
+        const auditErr = mapErrorToUserMessage(auditErrRaw);
+        const degradedObservations = [
+          ...pressReport.observations,
+          { severity: 'warning' as const, text: `Audit qualitatif IA indisponible : ${auditErr}` }
+        ];
+        const finalized = finalizePressStatus(
+          pressReport,
+          degradedObservations,
+          live.count,
+          false
+        );
+        updatedCritique = {
+          ...pressReport,
+          observations: degradedObservations,
+          recommendations: [
+            ...pressReport.recommendations,
+            `Vérifiez votre configuration IA dans les Paramètres : ${auditErr}`
+          ],
+          pressStatus: finalized.pressStatus,
+          pressAlertCount: finalized.pressAlertCount,
+          evaluatorModel: 'Contrôles PRESS (Audit IA indisponible)',
+          auditError: auditErr
+        };
+        setErrorBanner(auditErr);
       }
 
       const queryChanged = (resultData.pubmedQuery || '').trim() !== newQuery.trim();
@@ -565,6 +589,7 @@ function MeSHcraftStudioShell() {
               setSettings={setSettings}
               onGenerate={() => void handleGenerate()}
               isGenerating={isGenerating}
+              onOpenAiSettings={() => setIsAiSettingsOpen(true)}
             />
             {(isGenerating || currentStep > 0) && (
               <AgentStepper

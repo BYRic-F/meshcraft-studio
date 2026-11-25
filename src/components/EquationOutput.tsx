@@ -947,16 +947,19 @@ export default function EquationOutput({
             {benchmarkResult && (
               <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-1.5">
                 <div className="font-semibold text-slate-900">
-                  Couverture : {benchmarkResult.foundPmids.length} / {benchmarkResult.totalBenchmark} PMID repères présents dans l'échantillon ({benchmarkResult.coveragePercent}%)
+                  {t.step2.benchmarkCoverageSummary
+                    .replace('{found}', String(benchmarkResult.foundPmids.length))
+                    .replace('{total}', String(benchmarkResult.totalBenchmark))
+                    .replace('{pct}', String(benchmarkResult.coveragePercent))}
                 </div>
                 {benchmarkResult.foundPmids.length > 0 && (
                   <div className="text-emerald-700 font-mono">
-                    ✓ Retrouvés : {benchmarkResult.foundPmids.join(', ')}
+                    {t.step2.benchmarkFoundLabel} {benchmarkResult.foundPmids.join(', ')}
                   </div>
                 )}
                 {benchmarkResult.missingPmids.length > 0 && (
                   <div className="text-amber-700 font-mono">
-                    ⚠ Non présents dans l'échantillon chargé : {benchmarkResult.missingPmids.join(', ')}
+                    {t.step2.benchmarkMissingLabel} {benchmarkResult.missingPmids.join(', ')}
                   </div>
                 )}
               </div>

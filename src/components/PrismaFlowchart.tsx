@@ -38,6 +38,10 @@ import {
   Rob2ArticleEvaluation,
   aiEvaluateBatchRoB2,
   selectUnassessedRobBatch,
+  PRISMA_EXCLUSION_CATEGORY_KEYS,
+  PRISMA_EXCLUSION_LABELS_FR,
+  resolvePrismaExclusionCategory,
+  PrismaExclusionCategory,
   computeCochraneOverallRating,
   inferStudyDesignFromText,
   getAiConfig,
@@ -155,7 +159,7 @@ export default function PrismaFlowchart({
   const cancelScreeningRef = useRef<boolean>(false);
   const screeningAbortRef = useRef<AbortController | null>(null);
   const rayyanFileInputRef = useRef<HTMLInputElement>(null);
-  const [feedbackBanner, setFeedbackBanner] = useState<string | null>(null);
+  const [feedbackBanner, setFeedbackBanner] = useState<{ readonly kind: 'success' | 'error' | 'info'; readonly text: string } | null>(null);
 
   // État Étape 4 : Onglet de synthèse, périmètre, pagination, Risque de biais & Rapport
   const [step4Tab, setStep4Tab] = useState<'flowchart' | 'rob2' | 'matrix' | 'report'>('flowchart');
@@ -292,10 +296,10 @@ export default function PrismaFlowchart({
           exclusionReason: newStatus === 'excluded' ? (customReason || art.exclusionReason || defaultReason) : undefined,
           evidenceSnippet:
             newStatus === 'included'
-              ? 'Inclus manuellement par le lecteur.'
+              ? t.step3.manualNoteIncluded
               : newStatus === 'maybe'
-                ? 'Retenu manuellement pour vérification sur texte intégral.'
-                : `Exclu manuellement : ${customReason || art.exclusionReason || defaultReason}`,
+                ? t.step3.manualNoteMaybe
+                : `${t.step3.manualNoteExcludedPrefix}${customReason || art.exclusionReason || defaultReason}`,
           evaluatedBy: 'manual'
         };
       })
@@ -331,7 +335,7 @@ export default function PrismaFlowchart({
       );
     } catch (err: unknown) {
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
-        setFeedbackBanner(mapErrorToUserMessage(err));
+        setFeedbackBanner({ kind: 'error', text: mapErrorToUserMessage(err) });
       }
     } finally {
       screeningAbortRef.current = null;
@@ -368,13 +372,16 @@ export default function PrismaFlowchart({
       const text = await file.text();
       const decisions = parseRayyanImport(text);
       if (decisions.size === 0) {
-        setFeedbackBanner("Aucune décision RAYYAN-INCLUSION détectée dans ce fichier. Vérifiez qu'il s'agit bien d'un export Rayyan (.csv ou .ris).");
+        setFeedbackBanner({ kind: 'error', text: t.step3.rayyanImportEmpty });
       } else {
         setArticles(prev => applyRayyanDecisions(prev, decisions));
-        setFeedbackBanner(`✓ ${decisions.size} décision(s) de double lecture importée(s) depuis Rayyan avec succès.`);
+        setFeedbackBanner({
+          kind: 'success',
+          text: t.step3.rayyanImportSuccess.replace('{n}', String(decisions.size))
+        });
       }
     } catch (err: unknown) {
-      setFeedbackBanner(mapErrorToUserMessage(err));
+      setFeedbackBanner({ kind: 'error', text: mapErrorToUserMessage(err) });
     } finally {
       e.target.value = '';
     }
@@ -438,15 +445,24 @@ export default function PrismaFlowchart({
       }
 
       if (wasCancelled) {
-        setFeedbackBanner(t.step4.robStoppedFeedback.replace('{n}', String(totalEvaluated)));
+        setFeedbackBanner({
+          kind: 'info',
+          text: t.step4.robStoppedFeedback.replace('{n}', String(totalEvaluated))
+        });
       } else if (totalEvaluated > 0) {
-        setFeedbackBanner(t.step4.robDoneFeedback.replace('{n}', String(totalEvaluated)));
+        setFeedbackBanner({
+          kind: 'success',
+          text: t.step4.robDoneFeedback.replace('{n}', String(totalEvaluated))
+        });
       }
     } catch (err: unknown) {
       if (err instanceof DOMException && err.name === 'AbortError') {
-        setFeedbackBanner(t.step4.robStoppedFeedback.replace('{n}', String(totalEvaluated)));
+        setFeedbackBanner({
+          kind: 'info',
+          text: t.step4.robStoppedFeedback.replace('{n}', String(totalEvaluated))
+        });
       } else {
-        setFeedbackBanner(mapErrorToUserMessage(err));
+        setFeedbackBanner({ kind: 'error', text: mapErrorToUserMessage(err) });
       }
     } finally {
       robAbortRef.current = null;
@@ -829,9 +845,32 @@ export default function PrismaFlowchart({
           )}
 
           {feedbackBanner && (
-            <div className="p-3 rounded-xl bg-slate-100 border border-slate-200 text-xs text-slate-800 flex items-center justify-between">
-              <span>{feedbackBanner}</span>
-              <button type="button" onClick={() => setFeedbackBanner(null)} className="font-bold text-slate-500 cursor-pointer">✕</button>
+            <div
+              className={`p-3 rounded-xl border text-xs flex items-center justify-between gap-2 ${
+                feedbackBanner.kind === 'error'
+                  ? 'bg-rose-50 border-rose-200 text-rose-800'
+                  : feedbackBanner.kind === 'success'
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                    : 'bg-slate-100 border-slate-200 text-slate-800'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                {feedbackBanner.kind === 'error' ? (
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                ) : feedbackBanner.kind === 'success' ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                ) : (
+                  <Info className="w-4 h-4 text-slate-600 shrink-0" />
+                )}
+                <span>{feedbackBanner.text}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setFeedbackBanner(null)}
+                className="font-bold opacity-70 hover:opacity-100 cursor-pointer shrink-0"
+              >
+                ✕
+              </button>
             </div>
           )}
         </div>
@@ -1029,17 +1068,28 @@ export default function PrismaFlowchart({
                           ? t.step3.exclusionReasonPrefix
                           : t.step3.clinicalNotePrefix}
                       </strong>
-                      <span>{art.status === 'excluded' ? (art.exclusionReason || art.evidenceSnippet) : art.evidenceSnippet}</span>
+                      <span>
+                        {art.status === 'excluded'
+                          ? art.evidenceSnippet && art.evidenceSnippet !== art.exclusionReason
+                            ? `${art.exclusionReason || PRISMA_EXCLUSION_LABELS_FR.other} — ${art.evidenceSnippet}`
+                            : (art.exclusionReason || art.evidenceSnippet)
+                          : art.evidenceSnippet}
+                      </span>
                     </div>
 
                     {art.status === 'excluded' && (
                       <select
-                        value={art.exclusionReason || t.step3.exclusionReasons[0]}
-                        onChange={e => handleManualDecision(art.pmid, 'excluded', e.target.value)}
-                        className="rounded border border-rose-200 bg-white px-2 py-1 text-[11px] text-slate-800"
+                        value={resolvePrismaExclusionCategory(undefined, art.exclusionReason)}
+                        onChange={e => {
+                          const cat = e.target.value as PrismaExclusionCategory;
+                          handleManualDecision(art.pmid, 'excluded', PRISMA_EXCLUSION_LABELS_FR[cat]);
+                        }}
+                        className="rounded border border-rose-200 bg-white px-2 py-1 text-[11px] text-slate-800 shrink-0"
                       >
-                        {t.step3.exclusionReasons.map(r => (
-                          <option key={r} value={r}>{r}</option>
+                        {PRISMA_EXCLUSION_CATEGORY_KEYS.map((catKey, idx) => (
+                          <option key={catKey} value={catKey}>
+                            {t.step3.exclusionReasons[idx] || PRISMA_EXCLUSION_LABELS_FR[catKey]}
+                          </option>
                         ))}
                       </select>
                     )}
@@ -1307,12 +1357,29 @@ export default function PrismaFlowchart({
         </div>
 
         {feedbackBanner && (
-          <div className="p-3 rounded-xl bg-indigo-50 border border-indigo-200 flex items-center justify-between gap-2">
-            <span className="text-xs font-medium text-indigo-900">{feedbackBanner}</span>
+          <div
+            className={`p-3 rounded-xl border flex items-center justify-between gap-2 ${
+              feedbackBanner.kind === 'error'
+                ? 'bg-rose-50 border-rose-200 text-rose-800'
+                : feedbackBanner.kind === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  : 'bg-indigo-50 border-indigo-200 text-indigo-900'
+            }`}
+          >
+            <div className="flex items-center gap-2 text-xs font-medium">
+              {feedbackBanner.kind === 'error' ? (
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+              ) : feedbackBanner.kind === 'success' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              ) : (
+                <Info className="w-4 h-4 text-indigo-600 shrink-0" />
+              )}
+              <span>{feedbackBanner.text}</span>
+            </div>
             <button
               type="button"
               onClick={() => setFeedbackBanner(null)}
-              className="text-xs text-indigo-700 hover:text-indigo-950 font-semibold px-2 cursor-pointer"
+              className="text-xs opacity-70 hover:opacity-100 font-semibold px-2 cursor-pointer shrink-0"
             >
               ✕
             </button>

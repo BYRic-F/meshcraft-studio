@@ -484,7 +484,7 @@ describe('Suite TDD · Résilience Cloud Multi-Fournisseurs, Parsing JSON, Cache
       expect(res[0].status).toBe('included');
     });
 
-    it('doit retourner null / [] proprement sur JSON totalement malformé sans lever d’exception', async () => {
+    it('doit retourner null dans extractJsonFromLlmResponse et propager une erreur explicite dans aiScreenBatchArticles sur JSON malformé', async () => {
       expect(extractJsonFromLlmResponse('Désolé, je ne peux pas répondre à cette demande.')).toBeNull();
 
       saveAiConfig({
@@ -498,14 +498,14 @@ describe('Suite TDD · Résilience Cloud Multi-Fournisseurs, Parsing JSON, Cache
       });
       vi.stubGlobal('fetch', fetchMock);
 
-      const res = await aiScreenBatchArticles(makeSampleArticles(2, 50000010), {
-        p: 'Adultes',
-        i: 'Halopéridol',
-        c: '',
-        o: 'Parkinsonisme'
-      });
-
-      expect(res).toEqual([]);
+      await expect(
+        aiScreenBatchArticles(makeSampleArticles(2, 50000010), {
+          p: 'Adultes',
+          i: 'Halopéridol',
+          c: '',
+          o: 'Parkinsonisme'
+        })
+      ).rejects.toThrow(/JSON de dépouillement valide/i);
     });
 
     it('doit récupérer les objets JSON complets d’un tableau tronqué en fin de réponse (max_tokens)', async () => {

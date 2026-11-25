@@ -30,6 +30,7 @@ export interface PicoFormProps {
   readonly setSettings: React.Dispatch<React.SetStateAction<PipelineSettings>>;
   readonly onGenerate: () => void;
   readonly isGenerating: boolean;
+  readonly onOpenAiSettings?: () => void;
 }
 
 type PicoKey = 'p' | 'i' | 'c' | 'o' | 'not';
@@ -131,6 +132,9 @@ export default function PicoForm({
 
   const handleApplyExtracted = () => {
     if (!nlpResult) return;
+    if (nlpResult.approach === 'pico' || nlpResult.approach === 'peco') {
+      setFrameworkMode(nlpResult.approach);
+    }
     setPicoInputs({
       p: nlpResult.p || '',
       i: nlpResult.i || '',
@@ -158,6 +162,8 @@ export default function PicoForm({
   };
 
   const handleLoadSampleText = (sample: 'fasting' | 'sglt2' | 'parkinson') => {
+    setNlpResult(null);
+    setNlpError(null);
     if (sample === 'fasting') {
       setFrameworkMode('pico');
       setRawNlpText(
@@ -330,18 +336,43 @@ export default function PicoForm({
             </div>
 
             {nlpError && (
-              <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 flex items-start gap-2.5 text-xs text-rose-800">
-                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                <span>{nlpError}</span>
+              <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 flex items-start justify-between gap-3 text-xs text-rose-800">
+                <div className="flex items-start gap-2.5">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <span>{nlpError}</span>
+                </div>
+                {onOpenAiSettings && (
+                  <button
+                    type="button"
+                    onClick={onOpenAiSettings}
+                    className="shrink-0 px-2.5 py-1 rounded-lg bg-white border border-rose-300 hover:bg-rose-100 text-rose-800 font-semibold transition-colors cursor-pointer"
+                  >
+                    {t.step1.openAiSettingsBtn}
+                  </button>
+                )}
               </div>
             )}
 
-            {nlpResult && (
+            {nlpResult && nlpResult.source && nlpResult.source !== 'rules' && (
               <div className="p-4 rounded-xl bg-emerald-50/60 border border-emerald-200 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-emerald-800">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                    <span>{nlpResult.reasoning}</span>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="space-y-0.5">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-emerald-800">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>{nlpResult.reasoning}</span>
+                    </div>
+                    <div className="text-[11px] text-emerald-700 pl-6">
+                      {t.step1.aiExtractedWith}{' '}
+                      <span className="font-semibold">
+                        {nlpResult.source === 'gemini'
+                          ? 'Google Gemini'
+                          : nlpResult.source === 'openai'
+                            ? 'OpenAI'
+                            : 'Anthropic Claude'}
+                      </span>
+                      {nlpResult.modelUsed ? ` · ${nlpResult.modelUsed}` : ''}
+                      {nlpResult.approach ? ` · ${nlpResult.approach.toUpperCase()}` : ''}
+                    </div>
                   </div>
                   <button
                     type="button"

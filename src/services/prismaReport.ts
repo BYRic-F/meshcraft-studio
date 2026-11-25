@@ -125,6 +125,32 @@ export function generateThesisMethodologyText(
     ? `\n\nÉquation de recherche Cochrane CENTRAL :\n${cochraneQuery}`
     : '';
 
+  const hasEmbase = prisma.identification.embaseEstimatedHits > 0;
+  const hasCochrane = prisma.identification.cochraneEstimatedHits > 0;
+
+  let databasesParagraph = '';
+  if (!hasEmbase && !hasCochrane) {
+    databasesParagraph =
+      "La base de données PubMed / MEDLINE (National Library of Medicine) a été interrogée. L'équation combine les descripteurs contrôlés MeSH et les termes libres correspondants dans le titre et le résumé [TiAb], reliés par les opérateurs booléens AND, OR et NOT. Les équations traduites pour Embase (Elsevier) et Cochrane CENTRAL sont fournies ci-dessous pour une extension multi-bases.";
+  } else {
+    const queriedDbs = [
+      'PubMed / MEDLINE (National Library of Medicine)',
+      ...(hasEmbase ? ['Embase (Elsevier)'] : []),
+      ...(hasCochrane ? ['Cochrane CENTRAL'] : [])
+    ];
+    const joinedDbs =
+      queriedDbs.length === 2
+        ? `${queriedDbs[0]} et ${queriedDbs[1]}`
+        : `${queriedDbs.slice(0, -1).join(', ')} et ${queriedDbs[queriedDbs.length - 1]}`;
+    const remainingNote =
+      !hasEmbase
+        ? " L'équation traduite pour Embase (Elsevier) est fournie ci-dessous pour une extension ultérieure."
+        : !hasCochrane
+          ? " L'équation traduite pour Cochrane CENTRAL est fournie ci-dessous pour une extension ultérieure."
+          : '';
+    databasesParagraph = `Les bases de données ${joinedDbs} ont été interrogées. Les équations combinent les descripteurs contrôlés (MeSH pour PubMed${hasEmbase ? ', Emtree pour Embase' : ''}) et les termes libres correspondants dans le titre et le résumé [TiAb], reliés par les opérateurs booléens AND, OR et NOT.${remainingNote}`;
+  }
+
   return `========================================================================
 CHAPITRE : MATÉRIEL ET MÉTHODES — REVUE SYSTÉMATIQUE DE LA LITTÉRATURE
 Protocole méthodologique : Standards PRISMA 2020 & Guide Cochrane
@@ -164,7 +190,7 @@ ${(exclusionCriteria && exclusionCriteria.length > 0)
 
 C. STRATÉGIE DE RECHERCHE DOCUMENTAIRE
 ------------------------------------------------------------------------
-Les bases de données PubMed / MEDLINE (National Library of Medicine), Embase (Elsevier) et la Cochrane Library ont été interrogées. Les équations combinent les descripteurs contrôlés (MeSH pour PubMed, Emtree pour Embase) et les termes libres correspondants dans le titre et le résumé [TiAb], reliés par les opérateurs booléens AND, OR et NOT.
+${databasesParagraph}
 
 Équation de recherche PubMed :
 ${pubmedQuery}

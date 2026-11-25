@@ -6,12 +6,12 @@
  */
 
 import {
-  aiScreenSingleArticle,
   aiScreenBatchArticles,
+  BatchScreenItemResult,
+  PRISMA_EXCLUSION_LABELS_FR,
+  formatPrismaExclusionReason,
   getAiConfig,
-  getActiveProviderLabel,
-  computeBackoffDelayMs,
-  mapErrorToUserMessage
+  getActiveProviderLabel
 } from './localAiService';
 
 export interface ScreenedArticle {
@@ -83,92 +83,11 @@ export function initializeUnscreenedArticles(articles: readonly RawPubMedArticle
 }
 
 /**
- * Crée un rapport de screening initialisé sans aucune règle codée en dur
- */
-export function initializeScreeningReport(articles: readonly RawPubMedArticleInput[]): ScreeningReport {
-  const unscreened = initializeUnscreenedArticles(articles);
-  return {
-    totalScreened: 0,
-    totalIncluded: 0,
-    totalExcluded: 0,
-    exclusionBreakdown: [],
-    screenedArticles: unscreened
-  };
-}
-
-/**
- * Compatibilité d'initialisation : ne déclenche AUCUN filtrage déterministe
- */
-export function runAgentScreening(articles: readonly RawPubMedArticleInput[], _pico?: unknown): ScreeningReport {
-  return initializeScreeningReport(articles);
-}
-
-/**
- * Évalue un article unitaire via le modèle Cloud actif (Gemini, OpenAI ou Anthropic)
- */
-export async function screenArticleDeep(
-  article: any,
-  pico: { p: string; i: string; c: string; o: string; not?: string }
-): Promise<ScreenedArticle> {
-  const config = getAiConfig();
-  const evaluatedBy: 'gemini' | 'openai' | 'anthropic' =
-    config.provider === 'openai' ? 'openai' : config.provider === 'anthropic' ? 'anthropic' : 'gemini';
-  const providerLabel = getActiveProviderLabel(config, 'batch');
-
-  const baseArticle: ScreenedArticle = {
-    pmid: String(article.pmid || ''),
-    doi: article.doi || undefined,
-    title: article.title || '',
-    authors: article.authors || '',
-    source: article.source || '',
-    pubDate: article.pubDate || '',
-    abstract: article.abstract || '',
-    meshHeadings: article.meshHeadings || [],
-    status: 'pending',
-    url: article.url || `https://pubmed.ncbi.nlm.nih.gov/${article.pmid}/`,
-    evaluatedBy
-  };
-
-  // Principe de précaution Cochrane / Protocole § 3 : une absence de résumé ne vaut jamais exclusion d'office
-  if (hasMissingOrEmptyAbstract(baseArticle.abstract)) {
-    return {
-      ...baseArticle,
-      status: 'maybe',
-      evidenceSnippet: "Résumé absent dans PubMed : référence retenue par précaution pour vérification sur texte intégral (directive Cochrane / PRISMA 2020).",
-      evaluatedBy
-    };
-  }
-
-  try {
-    const aiRes = await aiScreenSingleArticle(article, pico);
-    if (aiRes) {
-      return {
-        ...baseArticle,
-        status: aiRes.status,
-        exclusionReason: aiRes.exclusionReason,
-        evidenceSnippet: aiRes.evidenceSnippet,
-        evaluatedBy
-      };
-    }
-  } catch (err: unknown) {
-    console.warn(`[AgentScreener] Erreur IA pour PMID ${article.pmid}:`, mapErrorToUserMessage(err));
-  }
-
-  // En cas d'indisponibilité temporaire du modèle, classer en 'maybe' (À vérifier) plutôt que de bloquer l'utilisateur
-  return {
-    ...baseArticle,
-    status: 'maybe',
-    evidenceSnippet: `À vérifier manuellement (${providerLabel} momentanément indisponible).`,
-    evaluatedBy
-  };
-}
-
-/**
- * Dépouillement clinique intégral par lots avec isolation des pannes (Batch Fault Isolation),
- * Mega-Batching FinOps (35 notices/lot en Pay-As-You-Go) et respect du principe de précaution Cochrane.
+ * Dépouillement clinique intégral par lots avec respect du principe de précaution Cochrane.
+ * Propage toute erreur d'authentification, de quota ou de réponse invalide vers l'interface appelante.
  */
 export async function runAgentScreeningDeep(
-  articles: any[],
+  articles: readonly RawPubMedArticleInput[],
   pico: { p: string; i: string; c: string; o: string; not?: string },
   onProgress?: (current: number, total: number, articleTitle: string) => void,
   onArticleScreened?: (article: ScreenedArticle, index: number, total: number) => void,
@@ -198,7 +117,7 @@ export async function runAgentScreeningDeep(
 
   const isCancelled = (): boolean => Boolean(abortSignal?.aborted || (shouldCancel && shouldCancel()));
 
-  const batches: Array<{ startIdx: number; items: any[] }> = [];
+  const batches: Array<{ startIdx: number; items: readonly RawPubMedArticleInput[] }> = [];
   for (let i = 0; i < total; i += BATCH_SIZE) {
     batches.push({ startIdx: i, items: articles.slice(i, i + BATCH_SIZE) });
   }
@@ -206,26 +125,27 @@ export async function runAgentScreeningDeep(
   const screenedSlots: Array<ScreenedArticle | undefined> = new Array(total);
   let completedCount = 0;
 
-  const markBatchPending = (startIdx: number, batch: ReadonlyArray<Record<string, unknown>>) => {
+  const markBatchPending = (startIdx: number, batch: readonly RawPubMedArticleInput[]) => {
     for (let k = 0; k < batch.length; k++) {
       const art = batch[k];
       const pmid = String(art.pmid || '');
       screenedSlots[startIdx + k] = {
         pmid,
-        doi: typeof art.doi === 'string' ? art.doi : undefined,
-        title: String(art.title || ''),
-        authors: String(art.authors || ''),
-        source: String(art.source || ''),
-        pubDate: String(art.pubDate || ''),
-        abstract: String(art.abstract || ''),
-        meshHeadings: Array.isArray(art.meshHeadings) ? (art.meshHeadings as string[]) : [],
+        doi: art.doi || undefined,
+        title: art.title || '',
+        authors: art.authors || '',
+        source: art.source || '',
+        pubDate: art.pubDate || '',
+        abstract: art.abstract || '',
+        meshHeadings: Array.isArray(art.meshHeadings) ? [...art.meshHeadings] : [],
+        publicationTypes: Array.isArray(art.publicationTypes) ? [...art.publicationTypes] : [],
         status: 'pending',
-        url: typeof art.url === 'string' ? art.url : `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`
+        url: art.url || `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`
       };
     }
   };
 
-  const processBatch = async (batchEntry: { startIdx: number; items: any[] }) => {
+  const processBatch = async (batchEntry: { startIdx: number; items: readonly RawPubMedArticleInput[] }) => {
     const { startIdx, items: batch } = batchEntry;
     const batchStart = startIdx + 1;
     const batchEnd = Math.min(startIdx + batch.length, total);
@@ -238,39 +158,26 @@ export async function runAgentScreeningDeep(
     onProgress?.(completedCount + 1, total, `Analyse du lot (${batchStart} à ${batchEnd} / ${total}) par ${providerLabel}...`);
 
     // Séparer les articles avec résumé (évaluables par IA) et sans résumé (retenus d'office en 'maybe' selon Cochrane)
-    const articlesWithAbstract = batch.filter(a => !hasMissingOrEmptyAbstract(a.abstract));
-    let evaluatedBatch: any[] = [];
+    const articlesWithAbstract = batch
+      .filter(a => !hasMissingOrEmptyAbstract(a.abstract))
+      .map(a => ({
+        pmid: String(a.pmid || ''),
+        title: a.title || '',
+        abstract: a.abstract || '',
+        meshHeadings: a.meshHeadings ? [...a.meshHeadings] : []
+      }));
+
+    let evaluatedBatch: BatchScreenItemResult[] = [];
 
     if (articlesWithAbstract.length > 0) {
-      // queryAiModel applique déjà la cascade multi-modèles et le backoff sur erreurs réseau/HTTP ;
-      // on n'effectue qu'un seul nouvel essai rapide si le JSON renvoyé était vide/tronqué.
-      let attempt = 0;
-      const maxJsonRetries = 1;
-
-      while (attempt <= maxJsonRetries) {
-        if (isCancelled()) {
+      try {
+        evaluatedBatch = await aiScreenBatchArticles(articlesWithAbstract, pico, abortSignal);
+      } catch (err: unknown) {
+        if (isCancelled() || (err instanceof DOMException && err.name === 'AbortError')) {
           markBatchPending(startIdx, batch);
           return;
         }
-
-        try {
-          evaluatedBatch = await aiScreenBatchArticles(articlesWithAbstract, pico, abortSignal);
-          if (evaluatedBatch && evaluatedBatch.length > 0) {
-            break;
-          }
-          attempt++;
-          if (attempt <= maxJsonRetries && !isCancelled()) {
-            const backoffMs = computeBackoffDelayMs(0, 800, 1500);
-            await new Promise(r => setTimeout(r, backoffMs));
-          }
-        } catch (err: unknown) {
-          if (isCancelled() || (err instanceof DOMException && err.name === 'AbortError')) {
-            markBatchPending(startIdx, batch);
-            return;
-          }
-          console.warn(`[AgentScreener] Lot ${batchStart}-${batchEnd}:`, mapErrorToUserMessage(err));
-          break;
-        }
+        throw err;
       }
     }
 
@@ -279,9 +186,9 @@ export async function runAgentScreeningDeep(
       return;
     }
 
-    const evalMap = new Map<string, any>();
-    (evaluatedBatch || []).forEach(e => {
-      if (e?.pmid) {
+    const evalMap = new Map<string, BatchScreenItemResult>();
+    evaluatedBatch.forEach(e => {
+      if (e.pmid) {
         const rawKey = String(e.pmid).trim();
         const digitsKey = rawKey.replace(/\D+/g, '');
         evalMap.set(rawKey, e);
@@ -297,18 +204,28 @@ export async function runAgentScreeningDeep(
 
       let status: ScreenedArticle['status'] = 'maybe';
       let exclusionReason: string | undefined = undefined;
-      let evidenceSnippet = "À vérifier sur texte intégral.";
+      let evidenceSnippet = 'À vérifier sur texte intégral.';
 
       if (missingAbs) {
         status = 'maybe';
         evidenceSnippet = "Résumé absent dans PubMed : retenu par précaution pour vérification sur texte intégral (directive Cochrane / PRISMA 2020).";
       } else if (aiRes) {
         status = aiRes.status;
-        exclusionReason = aiRes.exclusionReason || (aiRes.status === 'excluded' ? "Non-conformité aux critères d'éligibilité PICO" : undefined);
-        evidenceSnippet = aiRes.evidenceSnippet || (aiRes.status === 'included' ? "Conforme aux critères PICO" : aiRes.status === 'maybe' ? "Information partielle au résumé : à vérifier sur texte intégral." : "Critère d'exclusion identifié");
+        exclusionReason =
+          aiRes.status === 'excluded'
+            ? formatPrismaExclusionReason(aiRes.exclusionCategory, aiRes.exclusionReason)
+            : undefined;
+        evidenceSnippet =
+          aiRes.evidenceSnippet ||
+          (aiRes.status === 'included'
+            ? 'Conforme aux critères PICO'
+            : aiRes.status === 'maybe'
+              ? 'Information partielle au résumé : à vérifier sur texte intégral.'
+              : PRISMA_EXCLUSION_LABELS_FR.other);
       } else {
-        status = 'maybe';
-        evidenceSnippet = "Lot mis en attente (serveur IA surchargé) : conservé en 'À vérifier' par précaution.";
+        throw new Error(
+          `Dépouillement IA incomplet sur le lot ${batchStart}-${batchEnd} : la notice PMID ${pmid} est absente de la réponse du modèle.`
+        );
       }
 
       const screened: ScreenedArticle = {
@@ -319,7 +236,8 @@ export async function runAgentScreeningDeep(
         source: art.source || '',
         pubDate: art.pubDate || '',
         abstract: art.abstract || '',
-        meshHeadings: art.meshHeadings || [],
+        meshHeadings: art.meshHeadings ? [...art.meshHeadings] : [],
+        publicationTypes: art.publicationTypes ? [...art.publicationTypes] : [],
         status,
         exclusionReason,
         evidenceSnippet,

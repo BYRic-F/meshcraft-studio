@@ -114,6 +114,9 @@ export interface TranslationDictionary {
     readonly benchmarkHelper: string;
     readonly benchmarkPlaceholder: string;
     readonly benchmarkVerifyBtn: string;
+    readonly benchmarkCoverageSummary: string;
+    readonly benchmarkFoundLabel: string;
+    readonly benchmarkMissingLabel: string;
     readonly backToStep1: string;
     readonly goToStep3: string;
   };
@@ -162,6 +165,11 @@ export interface TranslationDictionary {
     readonly clinicalNotePrefix: string;
     readonly exclusionReasons: readonly string[];
     readonly noAbstractFallback: string;
+    readonly manualNoteIncluded: string;
+    readonly manualNoteMaybe: string;
+    readonly manualNoteExcludedPrefix: string;
+    readonly rayyanImportEmpty: string;
+    readonly rayyanImportSuccess: string;
     readonly btnInclude: string;
     readonly btnMaybe: string;
     readonly btnExclude: string;
@@ -397,6 +405,8 @@ export const frDictionary: TranslationDictionary = {
     extractBtn: 'Structurer les axes avec l\'IA',
     extractingBtn: 'Structuration sémantique en cours...',
     applyExtractionBtn: 'Pré-remplir le formulaire',
+    openAiSettingsBtn: 'Paramètres & API',
+    aiExtractedWith: 'Structuré par',
     sampleFasting: 'Exemple : Jeûne intermittent',
     sampleSglt2: 'Exemple : Inhibiteurs SGLT2',
     sampleParkinson: 'Exemple : Parkinsonisme médicamenteux (PECO)',
@@ -470,6 +480,9 @@ export const frDictionary: TranslationDictionary = {
     benchmarkHelper: 'Optionnel : saisissez les PMID de 2 ou 3 articles clés que vous connaissez déjà pour vérifier que votre équation les retrouve bien.',
     benchmarkPlaceholder: 'Collez vos PMID de référence séparés par des virgules ou espaces (ex: 26474316, 39359014)...',
     benchmarkVerifyBtn: 'Vérifier la couverture',
+    benchmarkCoverageSummary: 'Couverture : {found} / {total} PMID repères présents dans l\'échantillon ({pct}%)',
+    benchmarkFoundLabel: '✓ Retrouvés :',
+    benchmarkMissingLabel: '⚠ Non présents dans l\'échantillon chargé :',
     backToStep1: '← Modifier le cadrage PICO',
     goToStep3: 'Passer à la sélection des études →'
   },
@@ -517,13 +530,20 @@ export const frDictionary: TranslationDictionary = {
     exclusionReasonPrefix: 'Motif : ',
     clinicalNotePrefix: 'Note clinique : ',
     exclusionReasons: [
-      'Population hors périmètre (ex: pédiatrie ou autre pathologie)',
-      'Intervention / Exposition non conforme ou retirée du marché',
-      'Critère de jugement absent (aucune mesure de l\'événement cible)',
-      'Modèle animal ou étude in vitro',
-      'Format sans données originales (éditorial, lettre, revue narrative)'
+      'Population hors périmètre',
+      'Intervention / Exposition non conforme',
+      'Comparateur non conforme',
+      'Critère de jugement absent ou hors périmètre',
+      'Plan d\'étude exclu (revue narrative, éditorial, protocole, cas isolé)',
+      'Modèle préclinique (animal ou in vitro)',
+      'Autre motif d\'exclusion'
     ],
     noAbstractFallback: 'Aucun résumé disponible dans PubMed pour cette référence.',
+    manualNoteIncluded: 'Inclus manuellement par le lecteur.',
+    manualNoteMaybe: 'Retenu manuellement pour vérification sur texte intégral.',
+    manualNoteExcludedPrefix: 'Exclu manuellement : ',
+    rayyanImportEmpty: 'Aucune décision RAYYAN-INCLUSION détectée dans ce fichier. Vérifiez qu\'il s\'agit bien d\'un export Rayyan (.csv ou .ris).',
+    rayyanImportSuccess: '{n} décision(s) de double lecture importée(s) depuis Rayyan avec succès.',
     btnInclude: 'Inclure',
     btnMaybe: 'À vérifier',
     btnExclude: 'Exclure',
@@ -759,6 +779,8 @@ export const enDictionary: TranslationDictionary = {
     extractBtn: 'Structure axes with AI',
     extractingBtn: 'Semantic structuring in progress...',
     applyExtractionBtn: 'Pre-fill form',
+    openAiSettingsBtn: 'API Settings',
+    aiExtractedWith: 'Structured by',
     sampleFasting: 'Sample: Intermittent Fasting',
     sampleSglt2: 'Sample: SGLT2 Inhibitors',
     sampleParkinson: 'Sample: Drug-Induced Parkinsonism (PECO)',
@@ -832,6 +854,9 @@ export const enDictionary: TranslationDictionary = {
     benchmarkHelper: 'Optional: enter the PMIDs of 2 or 3 key articles you already know to verify that your equation retrieves them.',
     benchmarkPlaceholder: 'Paste reference PMIDs separated by commas or spaces...',
     benchmarkVerifyBtn: 'Check coverage',
+    benchmarkCoverageSummary: 'Coverage: {found} / {total} benchmark PMIDs found in sample ({pct}%)',
+    benchmarkFoundLabel: '✓ Found:',
+    benchmarkMissingLabel: '⚠ Not present in loaded sample:',
     backToStep1: '← Edit PICO Framing',
     goToStep3: 'Proceed to Study Screening →'
   },
@@ -879,13 +904,20 @@ export const enDictionary: TranslationDictionary = {
     exclusionReasonPrefix: 'Reason: ',
     clinicalNotePrefix: 'Clinical note: ',
     exclusionReasons: [
-      'Out-of-scope population (e.g., pediatric or different condition)',
+      'Out-of-scope population',
       'Non-eligible intervention / exposure',
+      'Non-eligible comparator',
       'Target outcome not reported',
-      'Animal or in vitro study',
-      'Non-original format (editorial, letter, narrative review)'
+      'Excluded study design (narrative review, editorial, protocol, case report)',
+      'Preclinical model (animal or in vitro)',
+      'Other exclusion reason'
     ],
     noAbstractFallback: 'No abstract available in PubMed for this record.',
+    manualNoteIncluded: 'Manually included by reviewer.',
+    manualNoteMaybe: 'Manually marked for full-text check.',
+    manualNoteExcludedPrefix: 'Manually excluded: ',
+    rayyanImportEmpty: 'No RAYYAN-INCLUSION decision found in this file. Please ensure it is a valid Rayyan export (.csv or .ris).',
+    rayyanImportSuccess: 'Successfully imported {n} dual-review decision(s) from Rayyan.',
     btnInclude: 'Include',
     btnMaybe: 'Maybe',
     btnExclude: 'Exclude',

@@ -743,12 +743,14 @@ export async function fetchArticlesDetailsForIds(
     const fetchEndpoint = `efetch.fcgi?db=pubmed&id=${chunk.join(',')}&retmode=xml`;
     const fetchRes = await fetchNcbi(fetchEndpoint, 3, 15000, options.signal);
 
-    if (fetchRes.ok) {
-      const xmlText = await fetchRes.text();
-      if (xmlText && (xmlText.includes('<PubmedArticle') || xmlText.includes('<PubmedBookArticle'))) {
-        const parsed = parsePubMedEfetchXml(xmlText);
-        results.push(...parsed);
-      }
+    if (!fetchRes.ok) {
+      throw new Error(`Erreur PubMed efetch (HTTP ${fetchRes.status}).`);
+    }
+
+    const xmlText = await fetchRes.text();
+    if (xmlText && (xmlText.includes('<PubmedArticle') || xmlText.includes('<PubmedBookArticle'))) {
+      const parsed = parsePubMedEfetchXml(xmlText);
+      results.push(...parsed);
     }
 
     options.onProgress?.(Math.min(results.length, total), total);
@@ -772,78 +774,65 @@ export async function fetchExtendedPubMedArticles(
 ): Promise<PubMedArticle[]> {
   if (!query) return [...existingArticles];
 
-  try {
-    const maxToFetch = Math.min(2500, Math.max(0, targetCount));
-    if (maxToFetch === 0) return [...existingArticles];
+  const maxToFetch = Math.min(2500, Math.max(0, targetCount));
+  if (maxToFetch === 0) return [...existingArticles];
 
-    let allIds: readonly string[] =
-      knownIdList && knownIdList.length > 0 ? knownIdList.slice(0, maxToFetch) : [];
+  let allIds: readonly string[] =
+    knownIdList && knownIdList.length > 0 ? knownIdList.slice(0, maxToFetch) : [];
 
-    if (allIds.length === 0) {
-      const res = await fetchNcbi('esearch.fcgi', 3, 10000, signal, {
-        db: 'pubmed',
-        term: query,
-        retmode: 'json',
-        retmax: String(maxToFetch),
-        sort: 'relevance'
-      });
-      if (!res.ok) {
-        throw new Error(`PubMed esearch HTTP ${res.status}`);
-      }
-      let searchData: ESearchResponseJson = {};
-      try {
-        searchData = (await res.json()) as ESearchResponseJson;
-      } catch {
-        searchData = {};
-      }
-      allIds = (searchData?.esearchresult?.idlist || []).slice(0, maxToFetch);
-    }
-
-    if (allIds.length === 0) return [...existingArticles];
-
-    // Ne réutiliser que les articles déjà chargés avec leurs métadonnées complètes (efetch)
-    const completeExistingMap = new Map<string, PubMedArticle>();
-    for (const art of existingArticles) {
-      if (art.abstract && art.abstract.trim().length > 0) {
-        completeExistingMap.set(art.pmid, art);
-      }
-    }
-
-    const missingIds = allIds.filter((id) => !completeExistingMap.has(id));
-    if (missingIds.length === 0) {
-      return allIds
-        .map((id) => completeExistingMap.get(id))
-        .filter((a): a is PubMedArticle => Boolean(a));
-    }
-
-    const fetchedMap = new Map<string, PubMedArticle>(completeExistingMap);
-    const alreadyCount = completeExistingMap.size;
-    onProgress?.(alreadyCount, allIds.length);
-
-    const fetchedArticles = await fetchArticlesDetailsForIds(missingIds, {
-      chunkSize: 100,
-      signal,
-      onProgress: (loadedMissing) => {
-        onProgress?.(Math.min(alreadyCount + loadedMissing, allIds.length), allIds.length);
-      }
+  if (allIds.length === 0) {
+    const res = await fetchNcbi('esearch.fcgi', 3, 10000, signal, {
+      db: 'pubmed',
+      term: query,
+      retmode: 'json',
+      retmax: String(maxToFetch),
+      sort: 'relevance'
     });
-
-    for (const art of fetchedArticles) {
-      fetchedMap.set(art.pmid, art);
+    if (!res.ok) {
+      throw new Error(`PubMed esearch HTTP ${res.status}`);
     }
-
-    const ordered: PubMedArticle[] = [];
-    for (const id of allIds) {
-      const found = fetchedMap.get(id);
-      if (found) ordered.push(found);
-    }
-
-    return ordered;
-  } catch (err: unknown) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      throw err;
-    }
-    console.error('Erreur lors de la récupération étendue:', err);
-    return [...existingArticles];
+    const searchData = (await res.json().catch(() => ({}))) as ESearchResponseJson;
+    allIds = (searchData?.esearchresult?.idlist || []).slice(0, maxToFetch);
   }
+
+  if (allIds.length === 0) return [...existingArticles];
+
+  // Ne réutiliser que les articles déjà chargés avec leurs métadonnées complètes (efetch)
+  const completeExistingMap = new Map<string, PubMedArticle>();
+  for (const art of existingArticles) {
+    if (art.abstract && art.abstract.trim().length > 0) {
+      completeExistingMap.set(art.pmid, art);
+    }
+  }
+
+  const missingIds = allIds.filter((id) => !completeExistingMap.has(id));
+  if (missingIds.length === 0) {
+    return allIds
+      .map((id) => completeExistingMap.get(id))
+      .filter((a): a is PubMedArticle => Boolean(a));
+  }
+
+  const fetchedMap = new Map<string, PubMedArticle>(completeExistingMap);
+  const alreadyCount = completeExistingMap.size;
+  onProgress?.(alreadyCount, allIds.length);
+
+  const fetchedArticles = await fetchArticlesDetailsForIds(missingIds, {
+    chunkSize: 100,
+    signal,
+    onProgress: (loadedMissing) => {
+      onProgress?.(Math.min(alreadyCount + loadedMissing, allIds.length), allIds.length);
+    }
+  });
+
+  for (const art of fetchedArticles) {
+    fetchedMap.set(art.pmid, art);
+  }
+
+  const ordered: PubMedArticle[] = [];
+  for (const id of allIds) {
+    const found = fetchedMap.get(id);
+    if (found) ordered.push(found);
+  }
+
+  return ordered;
 }
