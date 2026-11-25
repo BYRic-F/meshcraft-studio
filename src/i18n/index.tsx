@@ -315,6 +315,41 @@ export interface TranslationDictionary {
     readonly confirmDeleteBtn: string;
     readonly cancelDeleteBtn: string;
   };
+  readonly prerequisitesModal: {
+    readonly title: string;
+    readonly subtitle: string;
+    readonly badgeRequired: string;
+    readonly badgeOptional: string;
+    readonly aiBlockTitle: string;
+    readonly aiKeyPlaceholderGemini: string;
+    readonly aiKeyPlaceholderOpenai: string;
+    readonly aiKeyPlaceholderAnthropic: string;
+    readonly aiPortalGemini: string;
+    readonly aiPortalOpenai: string;
+    readonly aiPortalAnthropic: string;
+    readonly testAiBtn: string;
+    readonly testingAiBtn: string;
+    readonly aiStatusReadyHint: string;
+    readonly aiStatusMissingHint: string;
+    readonly ncbiBlockTitle: string;
+    readonly ncbiPlaceholder: string;
+    readonly ncbiPortalLink: string;
+    readonly ncbiHelp: string;
+    readonly ncbiStatusConfigured: string;
+    readonly hetopBlockTitle: string;
+    readonly hetopUsernameLabel: string;
+    readonly hetopUsernamePlaceholder: string;
+    readonly hetopPasswordLabel: string;
+    readonly hetopPasswordPlaceholder: string;
+    readonly hetopHelp: string;
+    readonly hetopPortalLink: string;
+    readonly hetopTestBtn: string;
+    readonly hetopTestingBtn: string;
+    readonly hetopStatusConfigured: string;
+    readonly footerHintReady: string;
+    readonly footerHintMissingAi: string;
+    readonly enterStudioBtn: string;
+  };
   readonly footer: {
     readonly leftText: string;
     readonly rightText: string;
@@ -640,6 +675,41 @@ export const frDictionary: TranslationDictionary = {
     confirmDeleteBtn: 'Confirmer',
     cancelDeleteBtn: 'Annuler'
   },
+  prerequisitesModal: {
+    title: 'Configuration initiale · MeSHcraft Studio',
+    subtitle: 'Vos clés API sont enregistrées uniquement dans votre navigateur (stockage local) et ne transitent par aucun serveur tiers.',
+    badgeRequired: 'Requis',
+    badgeOptional: 'Optionnel',
+    aiBlockTitle: '1. Fournisseur IA',
+    aiKeyPlaceholderGemini: 'Collez votre clé API Google Gemini (AIzaSy…)',
+    aiKeyPlaceholderOpenai: 'Collez votre clé API OpenAI (sk-proj-…)',
+    aiKeyPlaceholderAnthropic: 'Collez votre clé API Anthropic (sk-ant-…)',
+    aiPortalGemini: 'Obtenir une clé Google AI Studio',
+    aiPortalOpenai: 'Obtenir une clé OpenAI',
+    aiPortalAnthropic: 'Obtenir une clé Anthropic',
+    testAiBtn: 'Tester la connexion',
+    testingAiBtn: 'Test en cours…',
+    aiStatusReadyHint: 'Clé IA renseignée — cliquez sur « Tester la connexion » pour vérifier ou accédez directement au studio.',
+    aiStatusMissingHint: 'Renseignez une clé API valide (Google Gemini, OpenAI ou Anthropic) pour continuer.',
+    ncbiBlockTitle: '2. Clé API NCBI PubMed',
+    ncbiPlaceholder: 'Clé API NCBI Entrez (facultatif)…',
+    ncbiPortalLink: 'Créer une clé NCBI gratuite',
+    ncbiHelp: 'PubMed fonctionne sans clé (3 req/s ; la clé gratuite porte la limite à 10 req/s).',
+    ncbiStatusConfigured: '10 req/s activé',
+    hetopBlockTitle: '3. Identifiants HeTOP / CISMeF',
+    hetopUsernameLabel: 'Identifiant HeTOP',
+    hetopUsernamePlaceholder: 'Nom d\'utilisateur HeTOP (facultatif)',
+    hetopPasswordLabel: 'Mot de passe HeTOP',
+    hetopPasswordPlaceholder: 'Mot de passe (facultatif)',
+    hetopHelp: 'La résolution MeSH fonctionne aussi sans compte HeTOP (le compte HeTOP ajoute la correspondance officielle française CISMeF).',
+    hetopPortalLink: 'Portail HeTOP',
+    hetopTestBtn: 'Tester HeTOP',
+    hetopTestingBtn: 'Test…',
+    hetopStatusConfigured: 'Identifiants enregistrés',
+    footerHintReady: 'Clé IA prête. Les accès NCBI et HeTOP restent configurables à tout moment dans Paramètres & API.',
+    footerHintMissingAi: 'Ajoutez une clé IA pour débloquer l\'accès au studio.',
+    enterStudioBtn: 'Accéder à MeSHcraft Studio'
+  },
   footer: {
     leftText: 'MeSHcraft Studio · Plateforme d\'ingénierie documentaire médicale & revues systématiques',
     rightText: 'Conforme PRISMA 2020, PRISMA-S & Cochrane Handbook · Thésaurus officiel HeTOP & NCBI Entrez'
@@ -964,6 +1034,41 @@ export const enDictionary: TranslationDictionary = {
     deleteBtn: 'Delete',
     confirmDeleteBtn: 'Confirm',
     cancelDeleteBtn: 'Cancel'
+  },
+  prerequisitesModal: {
+    title: 'Initial setup · MeSHcraft Studio',
+    subtitle: 'Your API keys are stored solely in your browser (local storage) and are never routed through any third-party server.',
+    badgeRequired: 'Required',
+    badgeOptional: 'Optional',
+    aiBlockTitle: '1. AI provider',
+    aiKeyPlaceholderGemini: 'Paste your Google Gemini API key (AIzaSy…)',
+    aiKeyPlaceholderOpenai: 'Paste your OpenAI API key (sk-proj-…)',
+    aiKeyPlaceholderAnthropic: 'Paste your Anthropic API key (sk-ant-…)',
+    aiPortalGemini: 'Get Google AI Studio key',
+    aiPortalOpenai: 'Get OpenAI key',
+    aiPortalAnthropic: 'Get Anthropic key',
+    testAiBtn: 'Test connection',
+    testingAiBtn: 'Testing…',
+    aiStatusReadyHint: 'AI key entered — click "Test connection" to verify or enter the studio directly.',
+    aiStatusMissingHint: 'Enter a valid API key (Google Gemini, OpenAI or Anthropic) to continue.',
+    ncbiBlockTitle: '2. NCBI PubMed API key',
+    ncbiPlaceholder: 'NCBI Entrez API key (optional)…',
+    ncbiPortalLink: 'Create free NCBI key',
+    ncbiHelp: 'PubMed works without a key (3 req/s; a free key raises the limit to 10 req/s).',
+    ncbiStatusConfigured: '10 req/s enabled',
+    hetopBlockTitle: '3. HeTOP / CISMeF credentials',
+    hetopUsernameLabel: 'HeTOP username',
+    hetopUsernamePlaceholder: 'HeTOP username (optional)',
+    hetopPasswordLabel: 'HeTOP password',
+    hetopPasswordPlaceholder: 'Password (optional)',
+    hetopHelp: 'MeSH resolution also works without a HeTOP account (a HeTOP account adds official French CISMeF mapping).',
+    hetopPortalLink: 'HeTOP portal',
+    hetopTestBtn: 'Test HeTOP',
+    hetopTestingBtn: 'Testing…',
+    hetopStatusConfigured: 'Credentials saved',
+    footerHintReady: 'AI key ready. NCBI and HeTOP access can also be updated later in Settings & API.',
+    footerHintMissingAi: 'Add an AI key to unlock the studio.',
+    enterStudioBtn: 'Open MeSHcraft Studio'
   },
   footer: {
     leftText: 'MeSHcraft Studio · Evidence-Based Medicine & Systematic Review Platform',

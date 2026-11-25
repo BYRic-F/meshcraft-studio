@@ -624,6 +624,17 @@ export async function checkLocalAiStatus(overrideConfig?: Partial<AiConfig>): Pr
   return testAiConnectionLive(overrideConfig);
 }
 
+export function canUnlockPrerequisitesModal(params: {
+  readonly activeKey: string;
+  readonly testedStatus: LiveAiConnectionResult | null;
+}): boolean {
+  if (params.testedStatus?.online) return true;
+  if (params.testedStatus && !params.testedStatus.online && params.testedStatus.httpStatus) {
+    return false;
+  }
+  return params.activeKey.trim().length >= 10;
+}
+
 type CloudProvider = 'gemini' | 'openai' | 'anthropic';
 
 class AuthFailFastError extends Error {

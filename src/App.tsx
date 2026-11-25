@@ -351,10 +351,7 @@ function MeSHcraftStudioShell() {
   useEffect(() => {
     checkLocalAiStatus().then(st => {
       setAiStatus(st);
-      const isAiOk = Boolean(st?.online);
-      const isNcbiOk = hasNcbiApiKey();
-      const isHetopOk = isHetopConfigured();
-      if (!isAiOk || !isNcbiOk || !isHetopOk) {
+      if (!st?.online) {
         setIsPrerequisitesOpen(true);
       }
     }).catch(() => {

@@ -32,7 +32,8 @@ import {
   computePicoFingerprint,
   getAiConfig,
   saveAiConfig,
-  testAiConnectionLive
+  testAiConnectionLive,
+  canUnlockPrerequisitesModal
 } from '../../src/services/localAiService';
 import {
   extractSubConcepts,
@@ -1723,6 +1724,41 @@ describe('1. Tests Unitaires & Conformité Constitutionnelle (gemini.md)', () =>
       } finally {
         globalThis.fetch = originalFetch;
       }
+    });
+
+    it('doit débloquer la configuration initiale dès qu\'une clé IA valide est fournie sans exiger NCBI ni HeTOP', () => {
+      expect(canUnlockPrerequisitesModal({ activeKey: '', testedStatus: null })).toBe(false);
+      expect(canUnlockPrerequisitesModal({ activeKey: 'short', testedStatus: null })).toBe(false);
+      expect(canUnlockPrerequisitesModal({ activeKey: 'AIzaSyValidKey123456', testedStatus: null })).toBe(true);
+      expect(
+        canUnlockPrerequisitesModal({
+          activeKey: 'AIzaSyInvalidKey123456',
+          testedStatus: {
+            online: false,
+            provider: 'Google Gemini',
+            models: [],
+            activeModel: 'gemini-pro-latest',
+            routingMode: 'smart',
+            httpStatus: 403,
+            message: 'Clé API Google Gemini invalide (HTTP 403).'
+          }
+        })
+      ).toBe(false);
+      expect(
+        canUnlockPrerequisitesModal({
+          activeKey: 'AIzaSyValidKey123456',
+          testedStatus: {
+            online: true,
+            provider: 'Google Gemini',
+            models: [],
+            activeModel: 'gemini-pro-latest',
+            routingMode: 'smart',
+            httpStatus: 200,
+            latencyMs: 120,
+            message: 'Connecté · gemini-pro-latest (120 ms)'
+          }
+        })
+      ).toBe(true);
     });
   });
 });
