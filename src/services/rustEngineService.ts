@@ -55,6 +55,7 @@ export interface MeshDetails {
   allowedSubheadings?: string[];
   treeNumbers?: string[];
   isPharmacologicalSubstance?: boolean;
+  unresolvedMeshTerms?: readonly string[];
 }
 
 export type PicoAxisRoleRust =

@@ -1231,6 +1231,7 @@ export type PicoAxisRole =
 export interface NormalizedAtomicConcept {
   readonly conceptFr: string;
   readonly conceptEn: string;
+  readonly broaderMeshRoot?: string;
   readonly synonymsTiab: readonly string[];
 }
 
@@ -1766,13 +1767,24 @@ Tes évaluations et recommandations doivent respecter SANS EXCEPTION les critèr
      * "info" : toute remarque de dépouillement / vigilance au screening (ex. présence de revues narratives, d'études médico-économiques, hétérogénéité attendue d'une stratégie à haute sensibilité) ou suggestion facultative.
      * "warning" : UNIQUEMENT un défaut objectif et corrigible dans l'équation (concept clinique majeur ou DCI explicite manquant, bruit massif sur une troncature ambiguë, opérateur NOT destructif sur études mixtes, formule chimique IUPAC brute en [tiab]).
 
-7. CONTRAT DE SORTIE :
+7. INTERDICTION STRICTE D'HALLUCINER DES DESCRIPTEURS [Mesh] (Conformité NLM / HeTOP) :
+   - Ne cite et ne recommande JAMAIS une chaîne '...'[Mesh] ou "..."[Mesh] comme descripteur NLM existant à ajouter si elle ne figure PAS dans la liste des descripteurs MeSH validés fournis dans le contexte, ou si le terme figure dans les échecs de résolution (0 résultat NLM).
+   - Si un axe actif ne possède aucun descripteur MeSH validé, diagnostique une probable sur-spécification du concept (ex. adjectifs de chronicité, sévérité, caractère non spécifique ou localisation fine non pré-coordonnés dans le thésaurus MeSH) et recommande d'élargir vers la racine conceptuelle parente à faire résoudre via NLM, sans jamais fabriquer de balise [Mesh] non vérifiée.
+   - INTERDICTION ABSOLUE de répéter une recommandation portant sur un terme déjà signalé comme introuvable dans NLM (0 résultat NLM).
+
+8. CONTRAT DE SORTIE :
    - Réponds EXCLUSIVEMENT en JSON valide respectant le schéma attendu, avec temperature: 0.1.`;
 
 export interface PreviousAuditContext {
   readonly iteration: number;
   readonly previousWarnings: readonly string[];
   readonly changesSummary?: string;
+}
+
+export interface AxisMeshResolutionSummary {
+  readonly axis: 'P' | 'I' | 'C' | 'O' | 'NOT';
+  readonly validatedDescriptors: readonly string[];
+  readonly unresolvedTerms: readonly string[];
 }
 
 /**
@@ -1785,7 +1797,8 @@ export async function aiAuditAndCritiqueQuery(
   articleCount: number,
   sampleArticleTitles: string[],
   previousAudit?: PreviousAuditContext,
-  stratifiedTitles?: StratifiedTitleSample
+  stratifiedTitles?: StratifiedTitleSample,
+  meshResolutionByAxis?: readonly AxisMeshResolutionSummary[]
 ): Promise<(CritiqueReport & { observations: AuditObservationItem[] }) | null> {
   const hasStratified =
     Boolean(stratifiedTitles) &&
@@ -1834,6 +1847,25 @@ ${
 `
       : '';
 
+  const meshResolutionSection =
+    meshResolutionByAxis && meshResolutionByAxis.length > 0
+      ? [
+          `ÉTAT DE LA RÉSOLUTION OFFICIELLE HeTOP / NCBI MeSH PAR AXE :`,
+          ...meshResolutionByAxis.map((entry) => {
+            const validList =
+              entry.validatedDescriptors.length > 0
+                ? entry.validatedDescriptors.map((d) => `"${d}"`).join(', ')
+                : 'AUCUN (axe en texte libre uniquement)';
+            const failedList =
+              entry.unresolvedTerms.length > 0
+                ? entry.unresolvedTerms.map((t) => `"${t}"`).join(', ')
+                : 'aucun';
+            return `- Axe ${entry.axis} : MeSH validés = [${validList}] | Termes introuvables dans NLM (0 résultat) = [${failedList}]`;
+          }),
+          `Règle anti-hallucination : ne recommande JAMAIS un descripteur [Mesh] absent des MeSH validés ci-dessus ni un terme listé en 0 résultat NLM.`
+        ].join('\n')
+      : '';
+
   const prompt = `Audite la stratégie de recherche PubMed ci-dessous selon la grille PRESS 2015, les recommandations PRISMA-S et le Cochrane Handbook.
 
 CADRAGE CLINIQUE PICO/PECO :
@@ -1849,7 +1881,7 @@ ${pubmedQuery}
 """
 
 DESCRIPTEURS MeSH ACTIFS : [${mappedDescriptors.join(', ')}]
-VOLUMÉTRIE PUBMED : ${articleCount} notices
+${meshResolutionSection ? `${meshResolutionSection}\n` : ''}VOLUMÉTRIE PUBMED : ${articleCount} notices
 ${formattedSampleSection}
 ${deltaSection}
 GRILLE D'AUDIT QUALITATIF (PRESS 2015 / PRISMA-S / Cochrane Handbook) :
@@ -2292,6 +2324,11 @@ function sanitizeAtomicConceptList(raw: unknown): NormalizedAtomicConcept[] {
       .replace(/["“”«»]/g, '')
       .replace(/\s+/g, ' ')
       .trim();
+    const broaderMeshRoot = String(obj.broaderMeshRoot || '')
+      .replace(/\[[^\]]+\]/g, '')
+      .replace(/["“”«»*]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
     if (!conceptEn || conceptEn.length < 2) continue;
 
     const dedupKey = conceptEn.toLowerCase();
@@ -2313,9 +2350,14 @@ function sanitizeAtomicConceptList(raw: unknown): NormalizedAtomicConcept[] {
       )
     ).slice(0, 6);
 
+    const hasDistinctBroaderRoot =
+      broaderMeshRoot.length >= 2 &&
+      broaderMeshRoot.toLowerCase() !== conceptEn.toLowerCase();
+
     results.push({
       conceptFr: conceptFr || conceptEn,
       conceptEn,
+      ...(hasDistinctBroaderRoot ? { broaderMeshRoot } : {}),
       synonymsTiab
     });
   }
@@ -2346,7 +2388,8 @@ Règles méthodologiques PRISMA / Cochrane impératives :
 1. Pour chaque concept atomique, renvoie :
    - "conceptFr" : terme médical français court (1 à 4 mots maximum, sans phrase narrative ni posologie) adapté à HeTOP.
    - "conceptEn" : concept biomédical anglais canonique (sans balises [Mesh]/[tiab] ni opérateurs booléens) adapté à NCBI Entrez.
-   - "synonymsTiab" : 1 à 5 synonymes ou abréviations anglaises utiles en texte libre [tiab].
+   - "broaderMeshRoot" (optionnel, chaîne anglaise courte) : lorsque le concept clinique comporte des qualificatifs (chronicité, stade, sévérité, caractère non spécifique, étiologie secondaire, localisation fine), renseigne la racine nosologique ou thérapeutique canonique anglaise la plus directe susceptible d'exister comme descripteur officiel NLM (ex. "Low Back Pain" pour "chronic non-specific low back pain", "Heart Failure" pour "severe refractory heart failure"), tout en conservant les variantes précises dans "conceptEn" et "synonymsTiab". Si "conceptEn" est déjà une racine simple sans qualificatif, omets "broaderMeshRoot" ou laisse "".
+   - "synonymsTiab" : 1 à 5 synonymes ou abréviations anglaises utiles en texte libre [tiab] (incluant les variantes précises qualifiées).
 2. Axe P (Population / Pathologie cible) — Règles Cochrane / PRESS :
    - Lorsqu'une pathologie ou condition clinique est présente dans P, n'émets AUCUN critère démographique générique ni check tag non discriminant (population adulte générale, humains, âge moyen) : ils relèvent du dépouillement, et l'exclusion animale est déjà gérée par le filtre Cochrane.
    - Comme tous les concepts retournés dans un même axe P sont reliés par OR dans l'équation, si une sous-population clinique spécifique est mentionnée (ex. pédiatrie, gériatrie, grossesse), ne l'émets JAMAIS comme concept séparé dans le même groupe OR que la pathologie (ce qui détruirait la spécificité de la recherche) : n'émets que la pathologie ou condition clinique cible dans P et reporte ce critère d'âge ou de sous-population au dépouillement.
@@ -2361,13 +2404,13 @@ ${axesBlock}
 Format JSON attendu (inclure uniquement les clés d'axes fournies ci-dessus) :
 {
   "p": [
-    { "conceptFr": "terme français court", "conceptEn": "Canonical English Concept", "synonymsTiab": ["english synonym 1", "abbreviation"] }
+    { "conceptFr": "terme français court", "conceptEn": "Canonical English Concept", "broaderMeshRoot": "Broader NLM Root if qualified (optional)", "synonymsTiab": ["english synonym 1", "abbreviation"] }
   ],
   "i": [
-    { "conceptFr": "substance ou procédure spécifique", "conceptEn": "Specific Active Concept", "synonymsTiab": ["synonym 1", "abbrev"] }
+    { "conceptFr": "substance ou procédure spécifique", "conceptEn": "Specific Active Concept", "broaderMeshRoot": "", "synonymsTiab": ["synonym 1", "abbrev"] }
   ],
   "o": [
-    { "conceptFr": "critère 1", "conceptEn": "Outcome 1", "synonymsTiab": ["synonym 1"] }
+    { "conceptFr": "critère 1", "conceptEn": "Outcome 1", "broaderMeshRoot": "", "synonymsTiab": ["synonym 1"] }
   ]
 }`;
 
@@ -2535,7 +2578,7 @@ Propose une version optimisée du PICO et de l'activation des axes pour répondr
 RÈGLES STRICTES :
 1. Rédige les champs 'refinedPico' UNIQUEMENT en langage médical naturel français (sigles développés, SANS balises [Mesh]/[TiAb]/[pt], SANS opérateurs AND/OR/NOT).
 2. INTERDICTION STRICTE d'activer un axe C (comparateur passif) ou un axe NOT que l'utilisateur a laissé désactivé (Actif: false), SAUF en cas de bruit bibliographique manifeste explicitement signalé dans les recommandations d'audit.
-3. Pour chaque axe actif modifié ou conservé, fournis dans "atomicConcepts" les concepts biomédicaux atomiques normalisés ({ conceptFr court 1-4 mots pour HeTOP, conceptEn en anglais pour NCBI Entrez, synonymsTiab pour le texte libre }) et dans "englishCoreTerms" les concepts anglais correspondants. Sur les axes I et C, extrais UNIQUEMENT la substance active, le dispositif ou la procédure spécifique (sans émettre de concept séparé pour une simple voie d'administration ou un terme générique comme Therapeutics/Treatment). Sur O, sépare chaque critère distinct.
+3. Pour chaque axe actif modifié ou conservé, fournis dans "atomicConcepts" les concepts biomédicaux atomiques normalisés ({ conceptFr court 1-4 mots pour HeTOP, conceptEn en anglais pour NCBI Entrez, broaderMeshRoot optionnel pour la racine canonique anglaise si le concept comporte des qualificatifs de chronicité/sévérité/non-spécificité, synonymsTiab pour le texte libre }) et dans "englishCoreTerms" les concepts anglais correspondants. Sur les axes I et C, extrais UNIQUEMENT la substance active, le dispositif ou la procédure spécifique (sans émettre de concept séparé pour une simple voie d'administration ou un terme générique comme Therapeutics/Treatment). Sur O, sépare chaque critère distinct. Ne fabrique jamais de balise [Mesh] non vérifiée.
 
 Réponds STRICTEMENT au format JSON avec cette structure :
 {

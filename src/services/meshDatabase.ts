@@ -20,6 +20,7 @@ import {
 export interface AtomicConceptInput {
   readonly conceptFr?: string;
   readonly conceptEn: string;
+  readonly broaderMeshRoot?: string;
   readonly synonymsTiab?: readonly string[];
 }
 
@@ -625,10 +626,14 @@ export async function searchNcbiMesh(
     for (const c of atomicConcepts) {
       const cleanEn = (c.conceptEn || '').replace(/[()[\]"]/g, '').trim();
       const cleanFr = (c.conceptFr || '').replace(/[()[\]"]/g, '').trim();
+      const cleanBroader = (c.broaderMeshRoot || '').replace(/[()[\]"]/g, '').trim();
       if (cleanEn.length >= 2) {
         conceptsToResolve.push({
           conceptFr: cleanFr || undefined,
           conceptEn: cleanEn,
+          ...(cleanBroader.length >= 2 && cleanBroader.toLowerCase() !== cleanEn.toLowerCase()
+            ? { broaderMeshRoot: cleanBroader }
+            : {}),
           synonymsTiab: c.synonymsTiab
         });
       }
@@ -647,7 +652,10 @@ export async function searchNcbiMesh(
   }
 
   const cacheSignature = conceptsToResolve
-    .map((c) => `${normalizeText(c.conceptFr || '')}:${normalizeText(c.conceptEn)}`)
+    .map(
+      (c) =>
+        `${normalizeText(c.conceptFr || '')}:${normalizeText(c.conceptEn)}:${normalizeText(c.broaderMeshRoot || '')}`
+    )
     .join('|');
   const cacheKey = `${normalizeText(rawClean)}__${targetAxis || 'ANY'}__${cacheSignature}`;
 
@@ -664,6 +672,7 @@ export async function searchNcbiMesh(
   const existingIds = new Set<string>();
   const extraTiabTerms = new Set<string>();
   const unresolvedFreeTerms: string[] = [];
+  const unresolvedMeshAttempts = new Set<string>();
 
   for (const concept of conceptsToResolve) {
     for (const syn of concept.synonymsTiab || []) {
@@ -673,7 +682,29 @@ export async function searchNcbiMesh(
       }
     }
 
-    const details = await resolveAtomicConceptOfficial(concept, targetAxis);
+    // 1. Résolution officielle exacte d'abord (préserve tout descripteur pré-coordonné ex. "Renal Insufficiency, Chronic")
+    let details = await resolveAtomicConceptOfficial(concept, targetAxis);
+
+    // 2. Repli contrôlé sur `broaderMeshRoot` UNIQUEMENT si la résolution exacte renvoie 0 descripteur MeSH
+    if (!details) {
+      unresolvedMeshAttempts.add(concept.conceptEn);
+      const exactFreeEn = concept.conceptEn.replace(/["“”«»[\]*]/g, '').trim().toLowerCase();
+      if (exactFreeEn.length >= 2 && !exactFreeEn.includes(',') && !isIupacOrLabCodeTerm(exactFreeEn)) {
+        extraTiabTerms.add(exactFreeEn);
+      }
+
+      const broaderRoot = (concept.broaderMeshRoot || '').trim();
+      if (broaderRoot.length >= 2 && broaderRoot.toLowerCase() !== concept.conceptEn.toLowerCase()) {
+        details = await resolveAtomicConceptOfficial(
+          { conceptFr: broaderRoot, conceptEn: broaderRoot },
+          targetAxis
+        );
+        if (!details) {
+          unresolvedMeshAttempts.add(broaderRoot);
+        }
+      }
+    }
+
     if (details) {
       const rawItems =
         details.descriptors && details.descriptors.length > 0
@@ -776,6 +807,8 @@ export async function searchNcbiMesh(
     deriveTruncationTerms([freeTerm]).forEach((t) => mergedTruncations.add(t));
   }
 
+  const unresolvedMeshTerms = Array.from(unresolvedMeshAttempts);
+
   if (primaryDetails && foundDescriptors.length > 0) {
     const allEntryTerms = Array.from(mergedEntryTerms);
     const allPharmacological =
@@ -789,7 +822,8 @@ export async function searchNcbiMesh(
       scopeNote: primaryDetails.scopeNote,
       allowedSubheadings: Array.from(mergedAllowedSubheadings),
       treeNumbers: Array.from(mergedTreeNumbers),
-      isPharmacologicalSubstance: allPharmacological
+      isPharmacologicalSubstance: allPharmacological,
+      ...(unresolvedMeshTerms.length > 0 ? { unresolvedMeshTerms } : {})
     };
     meshResolutionCache.set(cacheKey, result);
     return result;
@@ -818,7 +852,8 @@ export async function searchNcbiMesh(
         isMajor: false
       }
     ],
-    truncationTerms: freeTruncs
+    truncationTerms: freeTruncs,
+    ...(unresolvedMeshTerms.length > 0 ? { unresolvedMeshTerms } : {})
   };
   meshResolutionCache.set(cacheKey, freeResult);
   return freeResult;

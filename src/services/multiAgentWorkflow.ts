@@ -19,6 +19,7 @@ import {
   aiExtractClinicalPico,
   aiNormalizePicoConcepts,
   aiAuditAndCritiqueQuery,
+  AxisMeshResolutionSummary,
   PreviousAuditContext,
   ClinicalPicoExtractionResult,
   PicoSemanticQualifications,
@@ -89,6 +90,7 @@ export interface MappedBlock {
   axisRole?: PicoAxisRoleRust;
   impliedSubheadings?: string[];
   isPharmacologicalSubstance?: boolean;
+  unresolvedMeshTerms?: readonly string[];
 }
 
 export async function parseClinicalAbstractNLP(rawText: string): Promise<ClinicalPicoExtractionResult> {
@@ -427,7 +429,10 @@ export async function runMultiAgentPipeline(
         allowedSubheadings: meshDetails.allowedSubheadings || [],
         axisRole: resolvedRole,
         impliedSubheadings: qualification.impliedSubheadings,
-        isPharmacologicalSubstance: isPharmaAxis
+        isPharmacologicalSubstance: isPharmaAxis,
+        ...(meshDetails.unresolvedMeshTerms && meshDetails.unresolvedMeshTerms.length > 0
+          ? { unresolvedMeshTerms: meshDetails.unresolvedMeshTerms }
+          : {})
       });
     }
   }
@@ -511,6 +516,14 @@ export async function runMultiAgentPipeline(
     };
   } else {
     try {
+      const meshResolutionByAxis: AxisMeshResolutionSummary[] = mappedBlocks.map((b) => ({
+        axis: b.picoType,
+        validatedDescriptors: b.descriptors
+          .filter((d) => Boolean(d.meshId && !d.meshId.startsWith('Concept-') && d.meshId !== 'Custom'))
+          .map((d) => d.descriptor),
+        unresolvedTerms: b.unresolvedMeshTerms ?? []
+      }));
+
       const aiCritique = await aiAuditAndCritiqueQuery(
         effectiveAuditPico,
         pubmedQuery,
@@ -518,7 +531,8 @@ export async function runMultiAgentPipeline(
         liveResult.count,
         sampleTitles,
         settings.previousAudit,
-        liveResult.stratifiedSample
+        liveResult.stratifiedSample,
+        meshResolutionByAxis
       );
       if (aiCritique) {
         const finalized = finalizePressStatus(

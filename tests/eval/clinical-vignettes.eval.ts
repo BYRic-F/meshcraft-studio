@@ -186,6 +186,7 @@ describe.skipIf(!HAS_GEMINI_KEY)(
       const question =
         "Chez les adultes atteints de lombalgie chronique non spécifique, quel est l'impact de l'éducation thérapeutique du patient sur la douleur et la qualité de vie ?";
       const extracted = await parseClinicalAbstractNLP(question);
+      expect(extracted.c.trim()).toBe('');
 
       const pipeline = await runMultiAgentPipeline(
         {
@@ -202,6 +203,8 @@ describe.skipIf(!HAS_GEMINI_KEY)(
           activePico: { p: true, i: true, c: false, o: true, not: false }
         }
       );
+
+      expect(pipeline.pubmedQuery).toMatch(/"Low Back Pain"\[Mesh\]/i);
 
       const queryWithoutCochraneFilter = pipeline.pubmedQuery.replace(
         /NOT\s*\("Animals"\[Mesh\]\s+NOT\s+"Humans"\[Mesh\]\)/gi,
@@ -243,6 +246,7 @@ describe.skipIf(!HAS_GEMINI_KEY)(
       // Aucune fusion en OR direct entre un descripteur d'âge pédiatrique et "Asthma"[Mesh] dans un même bloc
       const blocks = pipeline.pubmedQuery.split(/\nAND\n/i);
       const asthmaBlock = blocks.find((b) => /"Asthma"\[Mesh\]/i.test(b)) || '';
+      expect(asthmaBlock).not.toBe('');
       expect(asthmaBlock).not.toMatch(/"(?:Child|Child, Preschool|Infant|Adolescent|Pediatrics)"\[Mesh\]/i);
 
       const check = await verifyPubMedEsearchLive(pipeline.pubmedQuery);
