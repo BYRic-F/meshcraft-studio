@@ -1,0 +1,35 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+reports
+backups
+rust_engine/target
+.env
+.env.*
+!.env.example
+*.local
+
+# Documents personnels et manuscrits de thèse dans docs/
+docs/*.docx
+docs/*.pdf
+docs/these_extracted_preview.txt
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

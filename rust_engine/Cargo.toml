@@ -1,0 +1,16 @@
+[package]
+name = "meshcraft_rust_engine"
+version = "0.2.0"
+edition = "2021"
+description = "Moteur algébrique et morpho-syntaxique pur (PRISMA 2020 / NLM MeSH / Cochrane) pour MeSHcraft Studio"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+once_cell = "1.19"
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wasm-bindgen = "0.2"
+
