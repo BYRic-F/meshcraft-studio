@@ -42,6 +42,7 @@ import {
   clearActiveDraft,
   parseAndValidateReviewJson,
   buildDefaultReviewTitle,
+  hasMeaningfulDraftContent,
   computeReviewSummary,
   sanitizeSearchSettings
 } from './services/reviewStorageService';
@@ -53,6 +54,14 @@ import {
 
 type PipelineResultData = Awaited<ReturnType<typeof runMultiAgentPipeline>>;
 
+const EMPTY_PICO_INPUTS: PicoInputs = {
+  p: '',
+  i: '',
+  c: '',
+  o: '',
+  not: ''
+};
+
 const DEFAULT_SETTINGS: PipelineSettings = {
   strategy: 'balanced',
   qualifiers: [],
@@ -62,10 +71,10 @@ const DEFAULT_SETTINGS: PipelineSettings = {
   useTruncation: true,
   dateRange: {
     enabled: false,
-    startYear: '2021',
-    endYear: '2026',
-    startDate: '2006/10/29',
-    endDate: '2026/10/28'
+    startYear: '',
+    endYear: '',
+    startDate: undefined,
+    endDate: undefined
   }
 };
 
@@ -91,15 +100,10 @@ function MeSHcraftStudioShell() {
   const [isUpdatingQuery, setIsUpdatingQuery] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
-  const [picoInputs, setPicoInputs] = useState<PicoInputs>({
-    p: "Adultes en excès pondéral ou obésité",
-    i: "Jeûne intermittent",
-    c: "Alimentation habituelle ou absence de restriction",
-    o: "Variation du poids corporel et IMC",
-    not: "Diabète de type 2 ou résistance à l'insuline"
-  });
+  const [picoInputs, setPicoInputs] = useState<PicoInputs>(EMPTY_PICO_INPUTS);
 
   const [settings, setSettings] = useState<PipelineSettings>(DEFAULT_SETTINGS);
+  const [reviewResetKey, setReviewResetKey] = useState<number>(0);
 
   const [currentStep, setCurrentStep] = useState<number>(0);
   const [stepLogs, setStepLogs] = useState<Record<number, { status: string; message: string }>>({});
@@ -438,13 +442,7 @@ function MeSHcraftStudioShell() {
   // Auto-sauvegarde anti-F5 (debounce 1 000 ms) dès qu'un PICO ou un résultat existe
   useEffect(() => {
     if (!isDraftHydratedRef.current) return;
-    const hasContent = Boolean(
-      resultData ||
-      picoInputs.p.trim() ||
-      picoInputs.i.trim() ||
-      picoInputs.o.trim()
-    );
-    if (!hasContent) return;
+    if (!hasMeaningfulDraftContent(picoInputs, resultData)) return;
 
     const timer = setTimeout(() => {
       const payload = buildSnapshotPayload('__draft_tmp__');
@@ -502,8 +500,9 @@ function MeSHcraftStudioShell() {
 
   const handleStartNewReview = async (): Promise<void> => {
     await clearActiveDraft();
-    setPicoInputs({ p: '', i: '', c: '', o: '', not: '' });
+    setPicoInputs(EMPTY_PICO_INPUTS);
     setSettings(DEFAULT_SETTINGS);
+    setReviewResetKey(prev => prev + 1);
     setResultData(null);
     setScreenedArticles([]);
     setRobEvaluations({});
@@ -517,12 +516,7 @@ function MeSHcraftStudioShell() {
     setWizardStep(1);
   };
 
-  const canSaveCurrent = Boolean(
-    resultData ||
-    picoInputs.p.trim() ||
-    picoInputs.i.trim() ||
-    picoInputs.o.trim()
-  );
+  const canSaveCurrent = hasMeaningfulDraftContent(picoInputs, resultData);
   const isCurrentSaved = Boolean(justSavedStep2 || (activeReviewId && savedReviews.some(r => r.id === activeReviewId)));
   const prismaData = resultData
     ? generatePrismaSummaryData(resultData.liveResult, resultData.mappedBlocks, picoInputs, screenedArticles)
@@ -564,6 +558,7 @@ function MeSHcraftStudioShell() {
         {wizardStep === 1 && (
           <div className="space-y-5">
             <PicoForm
+              key={reviewResetKey}
               picoInputs={picoInputs}
               setPicoInputs={setPicoInputs}
               settings={settings}

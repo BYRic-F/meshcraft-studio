@@ -10,6 +10,7 @@ import {
   clearActiveDraft,
   serializeReviewToJson,
   parseAndValidateReviewJson,
+  hasMeaningfulDraftContent,
   resetInMemoryReviewStoreForTests
 } from '../../src/services/reviewStorageService';
 
@@ -226,5 +227,12 @@ describe('Service de persistance complète des revues (reviewStorageService)', (
       JSON.stringify({ schemaVersion: 1, screenedArticles: [], robEvaluations: {} })
     );
     expect(missingPicoRes.ok).toBe(false);
+  });
+
+  it('ne doit pas déclencher l\'auto-sauvegarde anti-F5 lorsque tous les axes PICO/PECO sont vides', () => {
+    expect(hasMeaningfulDraftContent({ p: '', i: '', c: '', o: '', not: '' }, null)).toBe(false);
+    expect(hasMeaningfulDraftContent({ p: '   ', i: '', c: '', o: '', not: '' }, null)).toBe(false);
+    expect(hasMeaningfulDraftContent({ p: 'Adultes', i: '', c: '', o: '', not: '' }, null)).toBe(true);
+    expect(hasMeaningfulDraftContent({ p: '', i: '', c: '', o: '', not: '' }, { pubmedQuery: '"X"[Mesh]' })).toBe(true);
   });
 });

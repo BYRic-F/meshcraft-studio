@@ -221,11 +221,11 @@ export default function PicoForm({
 
   const startYearValue = String(
     settings.dateRange?.startYear ??
-      (settings.dateRange?.startDate ? settings.dateRange.startDate.slice(0, 4) : '2006')
+      (settings.dateRange?.startDate ? settings.dateRange.startDate.slice(0, 4) : '')
   );
   const endYearValue = String(
     settings.dateRange?.endYear ??
-      (settings.dateRange?.endDate ? settings.dateRange.endDate.slice(0, 4) : '2026')
+      (settings.dateRange?.endDate ? settings.dateRange.endDate.slice(0, 4) : '')
   );
   const expertFilterCount = (settings.filters?.length ?? 0) + (settings.qualifiers?.length ?? 0);
 
@@ -508,8 +508,8 @@ export default function PicoForm({
                       enabled: !prev.dateRange?.enabled,
                       startYear: startYearValue,
                       endYear: endYearValue,
-                      startDate: startYearValue.length === 4 ? `${startYearValue}/01/01` : '2006/01/01',
-                      endDate: endYearValue.length === 4 ? `${endYearValue}/12/31` : '2026/12/31'
+                      startDate: startYearValue.length === 4 ? `${startYearValue}/01/01` : undefined,
+                      endDate: endYearValue.length === 4 ? `${endYearValue}/12/31` : undefined
                     }
                   }))
                 }
@@ -545,8 +545,8 @@ export default function PicoForm({
                       }
                     }));
                   }}
-                  placeholder="2006"
-                  className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono text-slate-800 focus:border-indigo-600 focus:outline-none"
+                  placeholder={t.step1.dateFromPlaceholder}
+                  className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono text-slate-800 placeholder:text-slate-400 placeholder:font-sans focus:border-indigo-600 focus:outline-none"
                 />
               </div>
               <div className="flex items-center gap-2">
@@ -570,8 +570,8 @@ export default function PicoForm({
                       }
                     }));
                   }}
-                  placeholder="2026"
-                  className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono text-slate-800 focus:border-indigo-600 focus:outline-none"
+                  placeholder={t.step1.dateToPlaceholder}
+                  className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono text-slate-800 placeholder:text-slate-400 placeholder:font-sans focus:border-indigo-600 focus:outline-none"
                 />
               </div>
             </div>

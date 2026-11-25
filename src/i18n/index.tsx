@@ -54,6 +54,8 @@ export interface TranslationDictionary {
     readonly dateRangeLabel: string;
     readonly dateFrom: string;
     readonly dateTo: string;
+    readonly dateFromPlaceholder: string;
+    readonly dateToPlaceholder: string;
     readonly dateEnable: string;
     readonly dateEnabled: string;
     readonly filtersLabel: string;
@@ -377,19 +379,19 @@ export const frDictionary: TranslationDictionary = {
     frameworkPico: 'Interventionnelle (PICO)',
     frameworkPeco: 'Observationnelle / Étiologique (PECO)',
     pLabel: 'P · Population / Pathologie cible',
-    pPlaceholder: 'Ex : Adultes en excès pondéral ou obésité, Infarctus du myocarde...',
+    pPlaceholder: 'Ex. : Adultes en excès pondéral ou obésité, Infarctus du myocarde…',
     iLabelPico: 'I · Intervention',
     iLabelPeco: 'E · Exposition',
-    iPlaceholderPico: 'Ex : Jeûne intermittent, Colchicine, Empagliflozine...',
-    iPlaceholderPeco: 'Ex : Antipsychotiques, Halopéridol, Rispéridone...',
+    iPlaceholderPico: 'Ex. : Jeûne intermittent, Colchicine, Empagliflozine…',
+    iPlaceholderPeco: 'Ex. : Antipsychotiques, Halopéridol, Rispéridone…',
     cLabel: 'C · Comparateur',
     cTooltip: 'Recommandation Cochrane & PRESS : laissé inactif par défaut pour ne pas restreindre le rappel. À activer uniquement en cas de comparaison directe active.',
-    cPlaceholder: 'Ex : Placebo, Soins standards, Absence d\'exposition...',
+    cPlaceholder: 'Ex. : Alimentation habituelle, Placebo, Absence d\'exposition…',
     oLabel: 'O · Critère de jugement principal (Outcome)',
-    oPlaceholder: 'Ex : Perte de poids, Syndrome parkinsonien induit, Mortalité...',
+    oPlaceholder: 'Ex. : Variation du poids corporel et IMC, Mortalité…',
     notLabel: 'NOT · Critères d\'exclusion',
     notTooltip: 'Recommandation Cochrane & PRESS : laissé inactif par défaut. À activer uniquement en cas de bruit avéré, pour ne pas exclure d\'études comparatives mixtes.',
-    notPlaceholder: 'Ex : Patients pédiatriques, Péricardite aiguë...',
+    notPlaceholder: 'Ex. : Diabète de type 2, Patients pédiatriques…',
     freeTextLabel: 'Décrivez votre sujet de recherche ou collez votre protocole / abstract :',
     freeTextPlaceholder: 'Décrivez votre sujet de thèse, votre question clinique ou collez l\'abstract de votre protocole pour pré-remplir automatiquement les axes...',
     extractBtn: 'Structurer les axes avec l\'IA',
@@ -408,6 +410,8 @@ export const frDictionary: TranslationDictionary = {
     dateRangeLabel: 'Bornes de dates',
     dateFrom: 'Année début',
     dateTo: 'Année fin',
+    dateFromPlaceholder: 'Ex. : 2016',
+    dateToPlaceholder: 'Ex. : 2026',
     dateEnable: 'Activer',
     dateEnabled: 'Activé ✓',
     filtersLabel: 'Filtres méthodologiques',
@@ -768,6 +772,8 @@ export const enDictionary: TranslationDictionary = {
     dateRangeLabel: 'Date bounds',
     dateFrom: 'Start year',
     dateTo: 'End year',
+    dateFromPlaceholder: 'e.g., 2016',
+    dateToPlaceholder: 'e.g., 2026',
     dateEnable: 'Enable',
     dateEnabled: 'Enabled ✓',
     filtersLabel: 'Methodological filters',

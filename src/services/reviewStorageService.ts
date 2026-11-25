@@ -146,6 +146,20 @@ export function buildDefaultReviewTitle(pico: PicoInputs): string {
   return 'Revue systématique sans titre';
 }
 
+export function hasMeaningfulDraftContent(
+  pico: PicoInputs,
+  resultData: unknown
+): boolean {
+  if (resultData) return true;
+  return Boolean(
+    (pico.p || '').trim() ||
+    (pico.i || '').trim() ||
+    (pico.c || '').trim() ||
+    (pico.o || '').trim() ||
+    (pico.not || '').trim()
+  );
+}
+
 function normalizeSnapshotForStorage(snapshot: SavedReviewSnapshot): SavedReviewSnapshot {
   const cleanSettings = sanitizeSearchSettings(snapshot.searchSettings);
   const summary = computeReviewSummary(
