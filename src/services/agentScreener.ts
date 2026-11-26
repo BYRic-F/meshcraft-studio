@@ -15,10 +15,35 @@ import {
   getActiveProviderLabel,
   mapErrorToUserMessage
 } from './localAiService';
+import {
+  BibliographicSource,
+  CanonicalStudyRecord,
+  StudyIdentifiers,
+  StudyRecordKind,
+  buildCanonicalRecordId,
+  extractFirstAuthorSurname,
+  extractPubYear,
+  inferRecordKindFromPubTypes,
+  normalizeDoi,
+  normalizePmid,
+  normalizeTitleForDedup,
+  resolvePreferredUrl
+} from './studyRecordTypes';
+
+export type {
+  BibliographicSource,
+  CanonicalStudyRecord,
+  StudyIdentifiers,
+  StudyRecordKind
+};
 
 export interface ScreenedArticle {
+  id?: string;
   pmid: string;
   doi?: string;
+  identifiers?: StudyIdentifiers;
+  sources?: readonly BibliographicSource[];
+  recordKind?: StudyRecordKind;
   title: string;
   authors: string;
   source: string;
@@ -26,6 +51,7 @@ export interface ScreenedArticle {
   abstract: string;
   meshHeadings: string[];
   publicationTypes?: string[];
+  language?: string;
   status: 'pending' | 'included' | 'maybe' | 'excluded' | 'error';
   exclusionReason?: string;
   evidenceSnippet?: string;
@@ -67,23 +93,55 @@ export interface RawPubMedArticleInput {
 }
 
 /**
+ * Normalise une notice brute PubMed (ou un objet compatible) vers le format canonique `CanonicalStudyRecord`.
+ */
+export function normalizePubMedToCanonical(art: RawPubMedArticleInput): CanonicalStudyRecord {
+  const pmid = normalizePmid(art.pmid) ?? (art.pmid !== undefined ? String(art.pmid).trim() : '');
+  const doi = normalizeDoi(art.doi);
+  const title = art.title || '';
+  const authors = art.authors || '';
+  const pubDate = art.pubDate || '';
+  const publicationTypes = Array.isArray(art.publicationTypes) ? [...art.publicationTypes] : [];
+  const identifiers: StudyIdentifiers = {
+    ...(normalizePmid(pmid) ? { pmid } : {}),
+    ...(doi ? { doi } : {})
+  };
+  const id = buildCanonicalRecordId(
+    identifiers,
+    normalizeTitleForDedup(title),
+    extractFirstAuthorSurname(authors),
+    extractPubYear(pubDate)
+  );
+  const url = resolvePreferredUrl(
+    identifiers,
+    art.url || (pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : '')
+  );
+
+  return {
+    id,
+    pmid,
+    ...(doi ? { doi } : {}),
+    identifiers,
+    sources: ['pubmed'],
+    recordKind: inferRecordKindFromPubTypes(publicationTypes, 'pubmed'),
+    title,
+    authors,
+    source: art.source || '',
+    pubDate,
+    abstract: art.abstract || '',
+    meshHeadings: Array.isArray(art.meshHeadings) ? [...art.meshHeadings] : [],
+    publicationTypes,
+    url,
+    status: 'pending'
+  };
+}
+
+/**
  * Initialise la liste des articles reçus de PubMed en statut "En attente de dépouillement"
  */
 export function initializeUnscreenedArticles(articles: readonly RawPubMedArticleInput[]): ScreenedArticle[] {
   if (!articles || articles.length === 0) return [];
-  return articles.map(art => ({
-    pmid: String(art.pmid || ''),
-    doi: art.doi || undefined,
-    title: art.title || '',
-    authors: art.authors || '',
-    source: art.source || '',
-    pubDate: art.pubDate || '',
-    abstract: art.abstract || '',
-    meshHeadings: Array.isArray(art.meshHeadings) ? [...art.meshHeadings] : [],
-    publicationTypes: Array.isArray(art.publicationTypes) ? [...art.publicationTypes] : [],
-    status: 'pending' as const,
-    url: art.url || `https://pubmed.ncbi.nlm.nih.gov/${art.pmid}/`
-  }));
+  return articles.map(art => normalizePubMedToCanonical(art));
 }
 
 /**

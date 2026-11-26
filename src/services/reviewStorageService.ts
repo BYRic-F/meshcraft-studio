@@ -10,6 +10,24 @@ import type { PicoInputs, PipelineSettings, MappedBlock, CritiqueReport } from '
 import type { PubMedResponse } from './rustEngineService';
 import type { ScreenedArticle } from './agentScreener';
 import type { Rob2ArticleEvaluation } from './localAiService';
+import {
+  BibliographicSource,
+  CANONICAL_SOURCE_ORDER,
+  CanonicalStudyRecord,
+  CorpusDeduplicationStats,
+  SourceImportBatch,
+  StudyIdentifiers,
+  StudyRecordKind,
+  buildCanonicalRecordId,
+  extractFirstAuthorSurname,
+  extractPubYear,
+  inferRecordKindFromPubTypes,
+  normalizeDoi,
+  normalizeEmbaseId,
+  normalizePmid,
+  normalizeTitleForDedup,
+  resolvePreferredUrl
+} from './studyRecordTypes';
 
 const DB_NAME = 'meshcraft_reviews_db';
 const DB_VERSION = 1;
@@ -37,7 +55,7 @@ export interface SavedReviewResultData {
 }
 
 export interface SavedReviewSnapshot {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 1 | 2;
   readonly id: string;
   readonly title: string;
   readonly createdAt: number;
@@ -50,6 +68,8 @@ export interface SavedReviewSnapshot {
   readonly refinementCount: number;
   readonly screenedArticles: ScreenedArticle[];
   readonly robEvaluations: Record<string, Rob2ArticleEvaluation>;
+  readonly importBatches?: readonly SourceImportBatch[];
+  readonly deduplicationStats?: CorpusDeduplicationStats;
 }
 
 const SENSITIVE_KEY_PATTERN = /(api[_-]?key|password|passwd|secret|token|authorization|hetop_?pass|hetop_?user|credentials)/i;
@@ -160,15 +180,99 @@ export function hasMeaningfulDraftContent(
   );
 }
 
+/**
+ * Hydrate de manière transparente une notice `v1.0.2` (ou partielle) vers le modèle canonique `CanonicalStudyRecord`
+ * tout en préservant `pmid`, `robEvaluations` et l'ensemble des décisions existantes.
+ */
+export function hydrateLegacyScreenedArticle(raw: ScreenedArticle): CanonicalStudyRecord {
+  const validSources = new Set<BibliographicSource>(CANONICAL_SOURCE_ORDER);
+  const rawSources = Array.isArray(raw.sources)
+    ? raw.sources.filter((s): s is BibliographicSource => validSources.has(s))
+    : [];
+
+  const normalizedPmid = normalizePmid(raw.identifiers?.pmid ?? raw.pmid);
+  const normalizedDoi = normalizeDoi(raw.identifiers?.doi ?? raw.doi);
+  const normalizedEmbaseId = normalizeEmbaseId(raw.identifiers?.embaseId ?? raw.identifiers?.embasePui);
+  const cochraneId = raw.identifiers?.cochraneId?.trim() || undefined;
+  const registryIds =
+    Array.isArray(raw.identifiers?.registryIds) && raw.identifiers.registryIds.length > 0
+      ? [...raw.identifiers.registryIds]
+      : undefined;
+
+  const identifiers: StudyIdentifiers = {
+    ...(normalizedPmid ? { pmid: normalizedPmid } : {}),
+    ...(normalizedDoi ? { doi: normalizedDoi } : {}),
+    ...(normalizedEmbaseId ? { embaseId: normalizedEmbaseId } : {}),
+    ...(raw.identifiers?.embasePui ? { embasePui: raw.identifiers.embasePui } : {}),
+    ...(cochraneId ? { cochraneId } : {}),
+    ...(registryIds ? { registryIds } : {})
+  };
+
+  const sources: BibliographicSource[] =
+    rawSources.length > 0
+      ? CANONICAL_SOURCE_ORDER.filter((s) => rawSources.includes(s))
+      : ['pubmed'];
+
+  const validKinds: readonly StudyRecordKind[] = ['article', 'review', 'trial_registry', 'other'];
+  const recordKind: StudyRecordKind =
+    raw.recordKind && validKinds.includes(raw.recordKind)
+      ? raw.recordKind
+      : inferRecordKindFromPubTypes(raw.publicationTypes, sources[0]);
+
+  const title = raw.title || '';
+  const authors = raw.authors || '';
+  const pubDate = raw.pubDate || '';
+
+  const id =
+    typeof raw.id === 'string' && raw.id.trim().length > 0
+      ? raw.id.trim()
+      : buildCanonicalRecordId(
+          identifiers,
+          normalizeTitleForDedup(title),
+          extractFirstAuthorSurname(authors),
+          extractPubYear(pubDate)
+        );
+
+  const pmid = normalizedPmid ?? (typeof raw.pmid === 'string' ? raw.pmid.trim() : '');
+  const url =
+    (typeof raw.url === 'string' && raw.url.trim()) ||
+    resolvePreferredUrl(identifiers, pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : '');
+
+  return {
+    id,
+    pmid,
+    ...(normalizedDoi ? { doi: normalizedDoi } : {}),
+    identifiers,
+    sources,
+    recordKind,
+    title,
+    authors,
+    source: raw.source || '',
+    pubDate,
+    abstract: raw.abstract || '',
+    meshHeadings: Array.isArray(raw.meshHeadings) ? [...raw.meshHeadings] : [],
+    publicationTypes: Array.isArray(raw.publicationTypes) ? [...raw.publicationTypes] : [],
+    ...(raw.language ? { language: raw.language } : {}),
+    url,
+    status: raw.status || 'pending',
+    ...(raw.exclusionReason ? { exclusionReason: raw.exclusionReason } : {}),
+    ...(raw.evidenceSnippet ? { evidenceSnippet: raw.evidenceSnippet } : {}),
+    ...(raw.evaluatedBy ? { evaluatedBy: raw.evaluatedBy } : {})
+  };
+}
+
 function normalizeSnapshotForStorage(snapshot: SavedReviewSnapshot): SavedReviewSnapshot {
   const cleanSettings = sanitizeSearchSettings(snapshot.searchSettings);
+  const hydratedArticles = (snapshot.screenedArticles || []).map((art) =>
+    hydrateLegacyScreenedArticle(art)
+  );
   const summary = computeReviewSummary(
     snapshot.resultData,
-    snapshot.screenedArticles,
+    hydratedArticles,
     snapshot.robEvaluations
   );
   const cleanSnapshot: SavedReviewSnapshot = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: snapshot.id,
     title: (snapshot.title || '').trim() || buildDefaultReviewTitle(snapshot.picoInputs),
     createdAt: Number.isFinite(snapshot.createdAt) ? snapshot.createdAt : Date.now(),
@@ -185,8 +289,12 @@ function normalizeSnapshotForStorage(snapshot: SavedReviewSnapshot): SavedReview
     searchSettings: cleanSettings,
     resultData: snapshot.resultData,
     refinementCount: Number.isFinite(snapshot.refinementCount) ? snapshot.refinementCount : 0,
-    screenedArticles: [...snapshot.screenedArticles],
-    robEvaluations: { ...snapshot.robEvaluations }
+    screenedArticles: hydratedArticles,
+    robEvaluations: { ...snapshot.robEvaluations },
+    ...(snapshot.importBatches && snapshot.importBatches.length > 0
+      ? { importBatches: [...snapshot.importBatches] }
+      : {}),
+    ...(snapshot.deduplicationStats ? { deduplicationStats: snapshot.deduplicationStats } : {})
   };
 
   return stripSensitiveKeys(cleanSnapshot) as SavedReviewSnapshot;
@@ -217,7 +325,8 @@ async function putRecord(record: SavedReviewSnapshot): Promise<SavedReviewSnapsh
 
 async function getRecord(id: string): Promise<SavedReviewSnapshot | null> {
   if (!hasIndexedDb()) {
-    return memoryStore.get(id) ?? null;
+    const rec = memoryStore.get(id) ?? null;
+    return rec && rec.schemaVersion === 1 ? normalizeSnapshotForStorage(rec) : rec;
   }
 
   try {
@@ -229,9 +338,13 @@ async function getRecord(id: string): Promise<SavedReviewSnapshot | null> {
       req.onerror = () => reject(req.error ?? new Error('IndexedDB read error'));
     });
     db.close();
+    if (record && record.schemaVersion === 1) {
+      return normalizeSnapshotForStorage(record);
+    }
     return record;
   } catch {
-    return memoryStore.get(id) ?? null;
+    const rec = memoryStore.get(id) ?? null;
+    return rec && rec.schemaVersion === 1 ? normalizeSnapshotForStorage(rec) : rec;
   }
 }
 
@@ -277,6 +390,7 @@ export async function listReviews(): Promise<SavedReviewSnapshot[]> {
 
   return allRecords
     .filter(item => item && item.id !== ACTIVE_DRAFT_ID)
+    .map(item => (item.schemaVersion === 1 ? normalizeSnapshotForStorage(item) : item))
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 }
 
@@ -338,10 +452,10 @@ export function parseAndValidateReviewJson(rawJson: string): ParseReviewJsonResu
     return { ok: false, error: 'Format de fichier invalide : objet de revue attendu.' };
   }
 
-  if (parsed.schemaVersion !== 1) {
+  if (parsed.schemaVersion !== 1 && parsed.schemaVersion !== 2) {
     return {
       ok: false,
-      error: `Version de schéma non prise en charge (attendu : 1, reçu : ${String(parsed.schemaVersion)}).`
+      error: `Version de schéma non prise en charge (attendu : 1 ou 2, reçu : ${String(parsed.schemaVersion)}).`
     };
   }
 
@@ -368,7 +482,11 @@ export function parseAndValidateReviewJson(rawJson: string): ParseReviewJsonResu
   }
 
   for (const item of parsed.screenedArticles) {
-    if (!isPlainObject(item) || typeof item.pmid !== 'string' || typeof item.title !== 'string') {
+    if (
+      !isPlainObject(item) ||
+      typeof item.title !== 'string' ||
+      (typeof item.id !== 'string' && typeof item.pmid !== 'string')
+    ) {
       return { ok: false, error: 'Une notice dans screenedArticles est invalide ou corrompue.' };
     }
   }
@@ -401,8 +519,16 @@ export function parseAndValidateReviewJson(rawJson: string): ParseReviewJsonResu
     not: typeof picoRaw.not === 'string' ? picoRaw.not : ''
   };
 
-  const screenedArticles = stripSensitiveKeys(parsed.screenedArticles) as ScreenedArticle[];
+  const screenedArticles = (stripSensitiveKeys(parsed.screenedArticles) as ScreenedArticle[]).map(
+    art => hydrateLegacyScreenedArticle(art)
+  );
   const robEvaluations = stripSensitiveKeys(parsed.robEvaluations) as Record<string, Rob2ArticleEvaluation>;
+  const importBatches = Array.isArray(parsed.importBatches)
+    ? (stripSensitiveKeys(parsed.importBatches) as SourceImportBatch[])
+    : undefined;
+  const deduplicationStats = isPlainObject(parsed.deduplicationStats)
+    ? (stripSensitiveKeys(parsed.deduplicationStats) as unknown as CorpusDeduplicationStats)
+    : undefined;
   const now = Date.now();
 
   const rawId = typeof parsed.id === 'string' && parsed.id.trim() && parsed.id !== ACTIVE_DRAFT_ID
@@ -415,7 +541,7 @@ export function parseAndValidateReviewJson(rawJson: string): ParseReviewJsonResu
       : buildDefaultReviewTitle(picoInputs);
 
   const snapshot = normalizeSnapshotForStorage({
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: rawId,
     title,
     createdAt: typeof parsed.createdAt === 'number' && Number.isFinite(parsed.createdAt) ? parsed.createdAt : now,
@@ -430,7 +556,9 @@ export function parseAndValidateReviewJson(rawJson: string): ParseReviewJsonResu
         ? parsed.refinementCount
         : 0,
     screenedArticles,
-    robEvaluations
+    robEvaluations,
+    ...(importBatches ? { importBatches } : {}),
+    ...(deduplicationStats ? { deduplicationStats } : {})
   });
 
   return { ok: true, snapshot };

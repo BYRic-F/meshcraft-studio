@@ -229,6 +229,59 @@ describe('Service de persistance complète des revues (reviewStorageService)', (
     expect(missingPicoRes.ok).toBe(false);
   });
 
+  it('doit migrer de façon transparente un snapshot JSON v1.0.2 (schemaVersion 1) vers schemaVersion 2 sans perdre robEvaluations ni les statuts', async () => {
+    const legacyJson = JSON.stringify(buildSampleSnapshot('rev-legacy-v1', 'Revue v1.0.2'));
+    const parsed = parseAndValidateReviewJson(legacyJson);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.snapshot.schemaVersion).toBe(2);
+      expect(parsed.snapshot.screenedArticles[0].id).toBe('pmid:40111222');
+      expect(parsed.snapshot.screenedArticles[0].sources).toEqual(['pubmed']);
+      expect(parsed.snapshot.screenedArticles[0].identifiers?.pmid).toBe('40111222');
+      expect(parsed.snapshot.screenedArticles[0].identifiers?.doi).toBe('10.1056/nejmoa2107038');
+      expect(parsed.snapshot.screenedArticles[0].recordKind).toBe('article');
+      expect(parsed.snapshot.screenedArticles[0].status).toBe('included');
+      expect(parsed.snapshot.robEvaluations['40111222']?.overall).toBe('low');
+
+      const withMultiBase = await saveReview({
+        ...parsed.snapshot,
+        importBatches: [
+          {
+            batchId: 'b1',
+            source: 'embase',
+            fileName: 'records.ris',
+            importedAt: 123456,
+            rawRecordCount: 6,
+            registryRecordCount: 0
+          }
+        ],
+        deduplicationStats: {
+          rawBySource: {
+            pubmed: 2,
+            embase: 6,
+            cochrane_reviews: 0,
+            cochrane_central: 0,
+            other_ris: 0
+          },
+          totalIdentifiedDatabases: 8,
+          totalIdentifiedRegisters: 0,
+          totalIdentified: 8,
+          duplicatesRemoved: 1,
+          uniqueCorpusCount: 7
+        }
+      });
+
+      const exported = serializeReviewToJson(withMultiBase);
+      const reimported = parseAndValidateReviewJson(exported);
+      expect(reimported.ok).toBe(true);
+      if (reimported.ok) {
+        expect(reimported.snapshot.schemaVersion).toBe(2);
+        expect(reimported.snapshot.importBatches).toHaveLength(1);
+        expect(reimported.snapshot.deduplicationStats?.duplicatesRemoved).toBe(1);
+      }
+    }
+  });
+
   it('ne doit pas déclencher l\'auto-sauvegarde anti-F5 lorsque tous les axes PICO/PECO sont vides', () => {
     expect(hasMeaningfulDraftContent({ p: '', i: '', c: '', o: '', not: '' }, null)).toBe(false);
     expect(hasMeaningfulDraftContent({ p: '   ', i: '', c: '', o: '', not: '' }, null)).toBe(false);

@@ -23,6 +23,7 @@ docs/*.docx
 docs/*.pdf
 docs/these_extracted_preview.txt
 
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

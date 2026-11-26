@@ -2155,14 +2155,26 @@ export interface BatchScreenItemResult {
 }
 
 /**
- * Compression clinique des résumés PubMed avant envoi au LLM.
- * Supprime les déclarations administratives (conflits d'intérêts, financements, droits d'auteur, affiliations)
- * pour économiser ~20 % de tokens d'entrée tout en préservant les numéros NCT/PROSPERO utiles au RoB 2.
+ * Compression clinique des résumés PubMed / Cochrane / Embase avant envoi au LLM.
+ * - Supprime les séparateurs Unicode U+2028/U+2029 et le préambule littéral "Abstract - "
+ * - Coupe avant "Plain language summary" (Cochrane Reviews) dès lors que le résumé scientifique
+ *   précédent atteint >= 250 caractères afin de préserver Background/Objectives/Results/Conclusions
+ * - Supprime les déclarations administratives tout en préservant les numéros NCT/PROSPERO utiles au RoB 2.
  */
 export function compressAbstractForLlm(rawAbstract: string, maxChars = 1200): string {
   if (!rawAbstract) return 'Aucun résumé disponible.';
   let cleaned = rawAbstract
+    .replace(/[\u2028\u2029]/g, ' ')
     .replace(/\r?\n/g, ' ')
+    .replace(/^Abstract\s*-\s*/i, '')
+    .trim();
+
+  const plsMatch = /\bplain\s+language\s+summary\b/i.exec(cleaned);
+  if (plsMatch && plsMatch.index >= 250) {
+    cleaned = cleaned.slice(0, plsMatch.index).trim();
+  }
+
+  cleaned = cleaned
     .replace(/\b(?:conflict(?:s)?\s+of\s+interest|competing\s+interests?|funding\s+statement|disclosures?|acknowledg(?:e)?ments?|author\s+contributions?)\s*:[^.]*\./gi, ' ')
     .replace(/©\s*\d{4}[^.]*\./g, ' ')
     .replace(/\b(?:copyright|all\s+rights\s+reserved)\b[^.]*\./gi, ' ')
