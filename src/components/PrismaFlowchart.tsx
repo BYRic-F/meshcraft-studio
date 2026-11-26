@@ -28,12 +28,27 @@ import {
 import {
   ScreenedArticle,
   initializeUnscreenedArticles,
+  normalizePubMedToCanonical,
   runAgentScreeningDeep,
   computeScreeningMetrics,
   selectPendingArticlesBatch,
   mergeScreenedArticleUpdate
 } from '../services/agentScreener';
 import { fetchExtendedPubMedArticles } from '../services/pubmedApi';
+import { parseRisContent } from '../services/risParserService';
+import {
+  deduplicateAndMergeCorpus,
+  mergeImportBatchIdempotent
+} from '../services/deduplicationService';
+import { hydrateLegacyScreenedArticle } from '../services/reviewStorageService';
+import {
+  BibliographicSource,
+  CorpusDeduplicationStats,
+  SourceImportBatch,
+  computeContentFingerprint,
+  formatPrimaryIdentifierLabel,
+  getArticleKey
+} from '../services/studyRecordTypes';
 import {
   Rob2ArticleEvaluation,
   aiEvaluateBatchRoB2,
@@ -66,6 +81,12 @@ export interface PrismaFlowchartProps {
       readonly pubmedHits?: number;
       readonly embaseEstimatedHits?: number;
       readonly cochraneEstimatedHits?: number;
+      readonly cochraneReviewsHits?: number;
+      readonly cochraneCentralHits?: number;
+      readonly otherRisHits?: number;
+      readonly registersHits?: number;
+      readonly databasesTotal?: number;
+      readonly uniqueRecordsAfterDedup?: number;
       readonly totalIdentified?: number;
       readonly duplicatesRemoved?: number;
     };
@@ -101,6 +122,10 @@ export interface PrismaFlowchartProps {
   readonly onScreenedArticlesChange?: React.Dispatch<React.SetStateAction<ScreenedArticle[]>>;
   readonly robEvaluations?: Record<string, Rob2ArticleEvaluation>;
   readonly onRobEvaluationsChange?: React.Dispatch<React.SetStateAction<Record<string, Rob2ArticleEvaluation>>>;
+  readonly importBatches?: readonly SourceImportBatch[];
+  readonly onImportBatchesChange?: React.Dispatch<React.SetStateAction<SourceImportBatch[]>>;
+  readonly deduplicationStats?: CorpusDeduplicationStats;
+  readonly onDeduplicationStatsChange?: React.Dispatch<React.SetStateAction<CorpusDeduplicationStats | undefined>>;
   readonly hydratedForQuery?: string;
   readonly onCorpusLoadedForQuery?: (query: string) => void;
   readonly isActive?: boolean;
@@ -124,6 +149,10 @@ export default function PrismaFlowchart({
   onScreenedArticlesChange,
   robEvaluations: controlledRobEvaluations,
   onRobEvaluationsChange,
+  importBatches: controlledImportBatches,
+  onImportBatchesChange,
+  deduplicationStats: controlledDeduplicationStats,
+  onDeduplicationStatsChange,
   hydratedForQuery = '',
   onCorpusLoadedForQuery,
   isActive = false,
@@ -139,7 +168,23 @@ export default function PrismaFlowchart({
   const articles = controlledArticles ?? localArticles;
   const setArticles: React.Dispatch<React.SetStateAction<ScreenedArticle[]>> =
     onScreenedArticlesChange ?? setLocalArticles;
+
+  const [localImportBatches, setLocalImportBatches] = useState<SourceImportBatch[]>([]);
+  const importBatches = controlledImportBatches ?? localImportBatches;
+  const setImportBatches: React.Dispatch<React.SetStateAction<SourceImportBatch[]>> =
+    onImportBatchesChange ?? setLocalImportBatches;
+
+  const [localDedupStats, setLocalDedupStats] = useState<CorpusDeduplicationStats | undefined>(undefined);
+  const deduplicationStats = controlledDeduplicationStats ?? localDedupStats;
+  const setDeduplicationStats = onDeduplicationStatsChange ?? setLocalDedupStats;
+
+  const importBatchesRef = useRef<readonly SourceImportBatch[]>(importBatches);
+  useEffect(() => {
+    importBatchesRef.current = importBatches;
+  }, [importBatches]);
+
   const [statusFilter, setStatusFilter] = useState<'all' | 'included' | 'maybe' | 'excluded' | 'pending'>('all');
+  const [sourceFilter, setSourceFilter] = useState<'all' | BibliographicSource | 'trial_registry'>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [expandedAbstracts, setExpandedAbstracts] = useState<Record<string, boolean>>({});
@@ -159,6 +204,7 @@ export default function PrismaFlowchart({
   const cancelScreeningRef = useRef<boolean>(false);
   const screeningAbortRef = useRef<AbortController | null>(null);
   const rayyanFileInputRef = useRef<HTMLInputElement>(null);
+  const risImportInputRef = useRef<HTMLInputElement>(null);
   const [feedbackBanner, setFeedbackBanner] = useState<{ readonly kind: 'success' | 'error' | 'info'; readonly text: string } | null>(null);
 
   // État Étape 4 : Onglet de synthèse, périmètre, pagination, Risque de biais & Rapport
@@ -179,11 +225,39 @@ export default function PrismaFlowchart({
   const metrics = computeScreeningMetrics(articles);
   const totalCohort = articles.length;
   const pubmedIdentified = prismaData?.identification?.pubmedHits ?? prismaData?.pubmedCount ?? totalCohort;
-  const embaseIdentified = prismaData?.identification?.embaseEstimatedHits ?? prismaData?.embaseCount ?? 0;
-  const identifiedTotal = pubmedIdentified + embaseIdentified;
-  const duplicatesRemoved = prismaData?.identification?.duplicatesRemoved ?? prismaData?.duplicatesRemoved ?? 0;
+  const embaseIdentified =
+    deduplicationStats?.rawBySource.embase ??
+    prismaData?.identification?.embaseEstimatedHits ??
+    prismaData?.embaseCount ??
+    0;
+  const cochraneReviewsIdentified =
+    deduplicationStats?.rawBySource.cochrane_reviews ??
+    prismaData?.identification?.cochraneReviewsHits ??
+    0;
+  const cochraneCentralIdentified =
+    deduplicationStats?.rawBySource.cochrane_central ??
+    prismaData?.identification?.cochraneCentralHits ??
+    0;
+  const cochraneIdentified =
+    cochraneReviewsIdentified + cochraneCentralIdentified ||
+    (prismaData?.identification?.cochraneEstimatedHits ?? 0);
+  const otherRisIdentified =
+    deduplicationStats?.rawBySource.other_ris ??
+    prismaData?.identification?.otherRisHits ??
+    0;
+  const registersIdentified =
+    deduplicationStats?.totalIdentifiedRegisters ??
+    prismaData?.identification?.registersHits ??
+    articles.filter((a) => a.recordKind === 'trial_registry').length;
+  const identifiedTotal =
+    pubmedIdentified + embaseIdentified + cochraneIdentified + otherRisIdentified;
+  const duplicatesRemoved =
+    deduplicationStats?.duplicatesRemoved ??
+    prismaData?.identification?.duplicatesRemoved ??
+    prismaData?.duplicatesRemoved ??
+    0;
   const isPartialPreview = pubmedIdentified > 2500;
-  const isCorpusCapped = pubmedIdentified > totalCohort && totalCohort > 0;
+  const isCorpusCapped = pubmedIdentified > totalCohort && totalCohort > 0 && embaseIdentified === 0 && cochraneIdentified === 0;
   const screenedCount = metrics.totalScreened > 0 ? metrics.totalScreened : totalCohort;
   const fullTextAssessed = metrics.totalIncluded + metrics.totalMaybe;
   const includedFinal = metrics.totalIncluded;
@@ -244,7 +318,32 @@ export default function PrismaFlowchart({
         if (!cancelled) {
           loadedQueryRef.current = trimmedQuery;
           setLoadRetryToken(0);
-          setArticles(initializeUnscreenedArticles(loadedArticles));
+
+          const pubmedCanonical = loadedArticles.map(art => normalizePubMedToCanonical(art));
+          const pubmedBatch: SourceImportBatch = {
+            batchId: `pubmed:${trimmedQuery.slice(0, 64)}`,
+            source: 'pubmed',
+            importedAt: Date.now(),
+            rawRecordCount: pubmedCanonical.length,
+            registryRecordCount: 0
+          };
+          const { batches: nextBatches } = mergeImportBatchIdempotent(
+            importBatchesRef.current,
+            pubmedBatch
+          );
+          importBatchesRef.current = nextBatches;
+          setImportBatches(nextBatches);
+
+          setArticles(prev => {
+            const existingCanonical = (prev || []).map(item => hydrateLegacyScreenedArticle(item));
+            const merged = deduplicateAndMergeCorpus(
+              existingCanonical,
+              pubmedCanonical,
+              nextBatches
+            );
+            setDeduplicationStats(merged.stats);
+            return merged.records;
+          });
           onCorpusLoadedForQuery?.(trimmedQuery);
           setCurrentPage(1);
           setExpandedAbstracts({});
@@ -278,18 +377,20 @@ export default function PrismaFlowchart({
     hydratedForQuery,
     articles.length,
     onCorpusLoadedForQuery,
-    setArticles
+    setArticles,
+    setImportBatches,
+    setDeduplicationStats
   ]);
 
   const aiConfig = getAiConfig();
   const activeEngineLabel = getActiveProviderLabel(aiConfig, 'batch');
 
-  // Actions de décision humaine sur une carte d'article
-  const handleManualDecision = (pmid: string, newStatus: 'included' | 'maybe' | 'excluded', customReason?: string) => {
+  // Actions de décision humaine sur une carte d'article (par clé canonique `art.id`)
+  const handleManualDecision = (articleKey: string, newStatus: 'included' | 'maybe' | 'excluded', customReason?: string) => {
     const defaultReason = t.step3.exclusionReasons[0];
     setArticles(prev =>
       prev.map(art => {
-        if (art.pmid !== pmid) return art;
+        if (getArticleKey(art) !== articleKey) return art;
         return {
           ...art,
           status: newStatus,
@@ -304,6 +405,91 @@ export default function PrismaFlowchart({
         };
       })
     );
+  };
+
+  const getSourceDisplayBadge = (src: BibliographicSource): string => {
+    if (src === 'pubmed') return t.step3.sourcePubmedLabel;
+    if (src === 'embase') return t.step3.sourceEmbaseLabel;
+    if (src === 'cochrane_reviews') return t.step3.sourceCochraneReviewsLabel;
+    if (src === 'cochrane_central') return t.step3.sourceCochraneCentralLabel;
+    return t.step3.sourceOtherRisLabel;
+  };
+
+  // Import multi-fichiers RIS (Cochrane Reviews, CENTRAL, Embase) avec fusion idempotente
+  const handleImportRisFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = e.target.files;
+    if (!fileList || fileList.length === 0) return;
+
+    try {
+      let currentRecords = articles.map(art => hydrateLegacyScreenedArticle(art));
+      let currentBatches = [...importBatchesRef.current];
+      let latestStats = deduplicationStats;
+      let totalAdded = 0;
+      let totalMerged = 0;
+      let skippedDuplicateFiles = 0;
+      const detectedSourceLabels = new Set<string>();
+
+      for (const file of Array.from(fileList)) {
+        const text = await file.text();
+        const parsed = parseRisContent(text, { fileName: file.name });
+        if (parsed.records.length === 0) {
+          setFeedbackBanner({
+            kind: 'error',
+            text: t.step3.multiBaseImportEmpty.replace('{file}', file.name)
+          });
+          continue;
+        }
+
+        const contentHash = computeContentFingerprint(text);
+        const batch: SourceImportBatch = {
+          batchId: `ris:${parsed.detectedSource}:${contentHash}`,
+          source: parsed.detectedSource,
+          fileName: file.name,
+          contentHash,
+          importedAt: Date.now(),
+          rawRecordCount: parsed.rawRecordCount,
+          registryRecordCount: parsed.registryRecordCount
+        };
+
+        const batchMerge = mergeImportBatchIdempotent(currentBatches, batch);
+        if (batchMerge.wasDuplicateBatch) {
+          skippedDuplicateFiles += 1;
+          continue;
+        }
+
+        currentBatches = batchMerge.batches;
+        const merged = deduplicateAndMergeCorpus(currentRecords, parsed.records, currentBatches);
+        currentRecords = merged.records;
+        latestStats = merged.stats;
+        totalAdded += merged.addedRecordsCount;
+        totalMerged += merged.mergedDuplicatesCount;
+        detectedSourceLabels.add(getSourceDisplayBadge(parsed.detectedSource));
+      }
+
+      if (totalAdded > 0 || totalMerged > 0) {
+        importBatchesRef.current = currentBatches;
+        setImportBatches(currentBatches);
+        setArticles(currentRecords);
+        if (latestStats) setDeduplicationStats(latestStats);
+        setCurrentPage(1);
+        setFeedbackBanner({
+          kind: 'success',
+          text: t.step3.multiBaseImportSuccess
+            .replace('{added}', String(totalAdded))
+            .replace('{merged}', String(totalMerged))
+            .replace('{source}', Array.from(detectedSourceLabels).join(', '))
+        });
+      } else if (skippedDuplicateFiles > 0) {
+        setFeedbackBanner({
+          kind: 'info',
+          text: t.step3.multiBaseImportDuplicate
+        });
+      }
+    } catch (err: unknown) {
+      setFeedbackBanner({ kind: 'error', text: mapErrorToUserMessage(err) });
+    } finally {
+      e.target.value = '';
+    }
   };
 
   // Lancement du pré-dépouillement IA par lots (tranche de 50 en attente ou totalité après confirmation)
@@ -400,7 +586,7 @@ export default function PrismaFlowchart({
     step4IncludeMaybe ? (a.status === 'included' || a.status === 'maybe') : a.status === 'included'
   );
   const eligibleRobArticles = step4ScopedArticles.filter(
-    a => inferStudyDesignFromText(a.title, a.abstract, a.publicationTypes) !== 'other'
+    a => inferStudyDesignFromText(a.title, a.abstract, a.publicationTypes, a.recordKind) !== 'other'
   );
   const unassessedRobArticles = selectUnassessedRobBatch(step4ScopedArticles, robEvaluations);
   const assessedEligibleRobCount = eligibleRobArticles.length - unassessedRobArticles.length;
@@ -436,9 +622,10 @@ export default function PrismaFlowchart({
           totalEvaluated += results.size;
           setRobEvaluations(prev => {
             const next = { ...prev };
-            for (const r of results.values()) {
-              if (!next[r.pmid]) {
-                next[r.pmid] = r;
+            for (const [entryKey, r] of results.entries()) {
+              const targetKey = r.recordId || entryKey;
+              if (!next[targetKey] && !(r.pmid && next[r.pmid])) {
+                next[targetKey] = r;
               }
             }
             return next;
@@ -483,11 +670,13 @@ export default function PrismaFlowchart({
   };
 
   const handleCycleRobDomain = (art: ScreenedArticle, domainKey: 'd1' | 'd2' | 'd3' | 'd4' | 'd5') => {
-    const inferredDesign = inferStudyDesignFromText(art.title, art.abstract, art.publicationTypes);
+    const inferredDesign = inferStudyDesignFromText(art.title, art.abstract, art.publicationTypes, art.recordKind);
     if (inferredDesign === 'other') return;
 
-    const existing = robEvaluations[art.pmid] || {
-      pmid: art.pmid,
+    const artKey = getArticleKey(art);
+    const existing = robEvaluations[artKey] || (art.pmid ? robEvaluations[art.pmid] : undefined) || {
+      recordId: artKey,
+      pmid: art.pmid || artKey,
       d1: 'moderate' as const,
       d2: 'moderate' as const,
       d3: 'low' as const,
@@ -502,8 +691,9 @@ export default function PrismaFlowchart({
     const order: ReadonlyArray<'low' | 'moderate' | 'high'> = ['low', 'moderate', 'high'];
     const currentVal = existing[domainKey];
     const nextVal = order[(order.indexOf(currentVal) + 1) % order.length];
-    const updated = {
+    const updated: Rob2ArticleEvaluation = {
       ...existing,
+      recordId: artKey,
       [domainKey]: nextVal,
       evaluatedBy: 'Manuel'
     };
@@ -511,19 +701,33 @@ export default function PrismaFlowchart({
 
     setRobEvaluations(prev => ({
       ...prev,
-      [art.pmid]: updated
+      [artKey]: updated
     }));
   };
 
   // Filtrage et pagination client (25 notices/page) pour l'étape 3
+  const hasMultiBaseOrRegistries =
+    articles.some(a => (a.sources && a.sources.some(s => s !== 'pubmed')) || a.recordKind === 'trial_registry') ||
+    importBatches.some(b => b.source !== 'pubmed');
+
   const filteredArticles = articles.filter(art => {
     if (statusFilter !== 'all' && art.status !== statusFilter) return false;
+    if (sourceFilter === 'trial_registry') {
+      if (art.recordKind !== 'trial_registry') return false;
+    } else if (sourceFilter !== 'all') {
+      const srcs = art.sources && art.sources.length > 0 ? art.sources : ['pubmed'];
+      if (!srcs.includes(sourceFilter)) return false;
+    }
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       return (
         art.title.toLowerCase().includes(q) ||
         art.authors.toLowerCase().includes(q) ||
-        art.pmid.includes(q)
+        art.pmid.toLowerCase().includes(q) ||
+        (art.doi || '').toLowerCase().includes(q) ||
+        (art.identifiers?.cochraneId || '').toLowerCase().includes(q) ||
+        (art.identifiers?.embasePui || '').toLowerCase().includes(q) ||
+        (art.identifiers?.registryIds || []).some(r => r.toLowerCase().includes(q))
       );
     }
     return true;
@@ -536,14 +740,14 @@ export default function PrismaFlowchart({
     safeCurrentPage * PAGE_SIZE
   );
   const allPageAbstractsExpanded =
-    paginatedArticles.length > 0 && paginatedArticles.every(a => Boolean(expandedAbstracts[a.pmid]));
+    paginatedArticles.length > 0 && paginatedArticles.every(a => Boolean(expandedAbstracts[getArticleKey(a)]));
 
   const handleTogglePageAbstracts = () => {
     setExpandedAbstracts(prev => {
       const next = { ...prev };
       const targetState = !allPageAbstractsExpanded;
       for (const art of paginatedArticles) {
-        next[art.pmid] = targetState;
+        next[getArticleKey(art)] = targetState;
       }
       return next;
     });
@@ -578,6 +782,11 @@ export default function PrismaFlowchart({
       identifiedTotal,
       pubmedCount: pubmedIdentified,
       embaseCount: embaseIdentified,
+      cochraneCount: cochraneIdentified,
+      cochraneReviewsCount: cochraneReviewsIdentified,
+      cochraneCentralCount: cochraneCentralIdentified,
+      otherRisCount: otherRisIdentified,
+      registersCount: registersIdentified,
       duplicatesRemoved,
       screened: screenedCount,
       excludedScreening: metrics.totalExcluded,
@@ -768,6 +977,58 @@ export default function PrismaFlowchart({
             </div>
           </div>
 
+          {/* Barre d'import multi-bases (.ris Cochrane Reviews / CENTRAL / Embase) */}
+          <div className="p-3.5 rounded-xl bg-indigo-50/40 border border-indigo-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="space-y-0.5">
+              <div className="text-xs font-bold text-slate-900">
+                {t.step3.multiBaseImportTitle}
+              </div>
+              <div className="text-[11px] text-slate-600">
+                {t.step3.multiBaseImportHint}
+              </div>
+              {(deduplicationStats || importBatches.some(b => b.source !== 'pubmed')) && (
+                <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                  <span className="px-2 py-0.5 rounded bg-white border border-indigo-200 text-[11px] font-mono text-indigo-900">
+                    {t.step3.dedupSummaryBanner
+                      .replace('{total}', identifiedTotal.toLocaleString('fr-FR'))
+                      .replace('{dups}', duplicatesRemoved.toLocaleString('fr-FR'))
+                      .replace('{unique}', totalCohort.toLocaleString('fr-FR'))}
+                  </span>
+                  {importBatches
+                    .filter(b => b.source !== 'pubmed')
+                    .map(b => (
+                      <span
+                        key={b.batchId}
+                        className="px-2 py-0.5 rounded bg-white border border-slate-200 text-[11px] text-slate-700"
+                      >
+                        {getSourceDisplayBadge(b.source)} ({b.rawRecordCount})
+                      </span>
+                    ))}
+                </div>
+              )}
+            </div>
+
+            <div className="shrink-0">
+              <input
+                ref={risImportInputRef}
+                type="file"
+                accept=".ris,.txt"
+                multiple
+                onChange={handleImportRisFiles}
+                className="hidden"
+              />
+              <button
+                type="button"
+                disabled={isLoadingCorpus}
+                onClick={() => risImportInputRef.current?.click()}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-indigo-300 bg-white hover:bg-indigo-50 disabled:opacity-50 text-indigo-700 text-xs font-semibold cursor-pointer transition-colors"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                <span>{t.step3.multiBaseImportBtn}</span>
+              </button>
+            </div>
+          </div>
+
           <p className="text-[11px] text-slate-500 pt-1 border-t border-slate-100">
             {t.step3.cochranePrecautionNote}
           </p>
@@ -882,72 +1143,108 @@ export default function PrismaFlowchart({
         </div>
 
         {/* Barre de filtres sémantiques (pastilles sobres) & Recherche & Déplier/Replier page */}
-        <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-xs flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-1.5">
-            {(
-              [
-                { id: 'all', label: `${t.step3.filterAll} (${articles.length})`, dotClass: null },
-                { id: 'included', label: `${t.step3.filterIncluded} (${metrics.totalIncluded})`, dotClass: 'bg-emerald-500' },
-                { id: 'maybe', label: `${t.step3.filterMaybe} (${metrics.totalMaybe})`, dotClass: 'bg-amber-500' },
-                { id: 'excluded', label: `${t.step3.filterExcluded} (${metrics.totalExcluded})`, dotClass: 'bg-rose-500' },
-                { id: 'pending', label: `${t.step3.filterPending} (${metrics.totalPending})`, dotClass: 'bg-slate-400' }
-              ] as const
-            ).map(tab => (
-              <button
-                key={tab.id}
-                type="button"
-                onClick={() => {
-                  setStatusFilter(tab.id);
-                  setCurrentPage(1);
-                }}
-                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all cursor-pointer ${
-                  statusFilter === tab.id
-                    ? 'bg-slate-900 text-white border-slate-900'
-                    : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
-                }`}
-              >
-                {tab.dotClass && <span className={`w-2 h-2 rounded-full ${tab.dotClass}`} />}
-                <span>{tab.label}</span>
-              </button>
-            ))}
-          </div>
+        <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-xs space-y-3">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(
+                [
+                  { id: 'all', label: `${t.step3.filterAll} (${articles.length})`, dotClass: null },
+                  { id: 'included', label: `${t.step3.filterIncluded} (${metrics.totalIncluded})`, dotClass: 'bg-emerald-500' },
+                  { id: 'maybe', label: `${t.step3.filterMaybe} (${metrics.totalMaybe})`, dotClass: 'bg-amber-500' },
+                  { id: 'excluded', label: `${t.step3.filterExcluded} (${metrics.totalExcluded})`, dotClass: 'bg-rose-500' },
+                  { id: 'pending', label: `${t.step3.filterPending} (${metrics.totalPending})`, dotClass: 'bg-slate-400' }
+                ] as const
+              ).map(tab => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => {
+                    setStatusFilter(tab.id);
+                    setCurrentPage(1);
+                  }}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all cursor-pointer ${
+                    statusFilter === tab.id
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+                  }`}
+                >
+                  {tab.dotClass && <span className={`w-2 h-2 rounded-full ${tab.dotClass}`} />}
+                  <span>{tab.label}</span>
+                </button>
+              ))}
+            </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            {paginatedArticles.length > 0 && (
-              <button
-                type="button"
-                onClick={handleTogglePageAbstracts}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 cursor-pointer shrink-0"
-              >
-                {allPageAbstractsExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-                <span>
-                  {allPageAbstractsExpanded
-                    ? t.step3.collapsePageAbstractsBtn
-                    : t.step3.expandPageAbstractsBtn}
-                </span>
-              </button>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              {paginatedArticles.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleTogglePageAbstracts}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 cursor-pointer shrink-0"
+                >
+                  {allPageAbstractsExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                  <span>
+                    {allPageAbstractsExpanded
+                      ? t.step3.collapsePageAbstractsBtn
+                      : t.step3.expandPageAbstractsBtn}
+                  </span>
+                </button>
+              )}
 
-            <div className="relative w-full sm:w-64">
-              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={e => {
-                  setSearchQuery(e.target.value);
-                  setCurrentPage(1);
-                }}
-                placeholder={t.step3.searchPlaceholder}
-                className="w-full rounded-lg border border-slate-200 bg-slate-50 pl-8 pr-3 py-1.5 text-xs text-slate-800 focus:bg-white focus:border-indigo-600 focus:outline-none"
-              />
+              <div className="relative w-full sm:w-64">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={e => {
+                    setSearchQuery(e.target.value);
+                    setCurrentPage(1);
+                  }}
+                  placeholder={t.step3.searchPlaceholder}
+                  className="w-full rounded-lg border border-slate-200 bg-slate-50 pl-8 pr-3 py-1.5 text-xs text-slate-800 focus:bg-white focus:border-indigo-600 focus:outline-none"
+                />
+              </div>
             </div>
           </div>
+
+          {hasMultiBaseOrRegistries && (
+            <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-100">
+              {(
+                [
+                  { id: 'all', label: t.step3.sourceAllLabel },
+                  { id: 'pubmed', label: t.step3.sourcePubmedLabel },
+                  { id: 'embase', label: t.step3.sourceEmbaseLabel },
+                  { id: 'cochrane_reviews', label: t.step3.sourceCochraneReviewsLabel },
+                  { id: 'cochrane_central', label: t.step3.sourceCochraneCentralLabel },
+                  { id: 'trial_registry', label: t.step3.trialRegistryFilterLabel }
+                ] as const
+              ).map(sf => (
+                <button
+                  key={sf.id}
+                  type="button"
+                  onClick={() => {
+                    setSourceFilter(sf.id);
+                    setCurrentPage(1);
+                  }}
+                  className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border cursor-pointer transition-colors ${
+                    sourceFilter === sf.id
+                      ? 'bg-indigo-600 text-white border-indigo-600'
+                      : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+                  }`}
+                >
+                  {sf.label}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Liste paginée des cartes d'articles (25/page) */}
         <div className="space-y-3">
           {paginatedArticles.map(art => {
-            const isExpanded = Boolean(expandedAbstracts[art.pmid]);
+            const artKey = getArticleKey(art);
+            const isExpanded = Boolean(expandedAbstracts[artKey]);
+            const artSources = art.sources && art.sources.length > 0 ? art.sources : ['pubmed' as const];
+            const idLabel = formatPrimaryIdentifierLabel(art);
             const evaluatorBadge =
               art.evaluatedBy === 'rayyan'
                 ? t.step3.evaluatorRayyan
@@ -963,7 +1260,7 @@ export default function PrismaFlowchart({
 
             return (
               <div
-                key={art.pmid}
+                key={artKey}
                 className={`bg-white rounded-xl border p-4 shadow-2xs transition-all space-y-3 ${
                   art.status === 'included'
                     ? 'border-l-4 border-l-emerald-500 border-slate-200'
@@ -997,15 +1294,34 @@ export default function PrismaFlowchart({
                           {evaluatorBadge}
                         </span>
                       )}
-                      <a
-                        href={art.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 text-xs font-mono font-semibold text-indigo-600 hover:underline"
-                      >
-                        <span>PMID: {art.pmid}</span>
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
+                      {artSources.map(src => (
+                        <span
+                          key={src}
+                          className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200"
+                        >
+                          {getSourceDisplayBadge(src)}
+                        </span>
+                      ))}
+                      {art.recordKind === 'trial_registry' && (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-50 text-amber-800 border border-amber-200">
+                          {t.step3.trialRegistryBadge}
+                        </span>
+                      )}
+                      {art.url ? (
+                        <a
+                          href={art.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-xs font-mono font-semibold text-indigo-600 hover:underline"
+                        >
+                          <span>{idLabel}</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      ) : (
+                        <span className="text-xs font-mono font-semibold text-slate-600">
+                          {idLabel}
+                        </span>
+                      )}
                       <span className="text-xs text-slate-500">
                         • {art.source} ({art.pubDate})
                       </span>
@@ -1015,7 +1331,7 @@ export default function PrismaFlowchart({
                       {art.title}
                     </h3>
                     <p className="text-xs text-slate-500">
-                      {art.authors}
+                      {art.authors || (art.recordKind === 'trial_registry' ? t.step3.trialRegistryAuthorsFallback : '')}
                     </p>
                   </div>
 
@@ -1023,7 +1339,7 @@ export default function PrismaFlowchart({
                   <div className="flex items-center gap-1.5 shrink-0">
                     <button
                       type="button"
-                      onClick={() => handleManualDecision(art.pmid, 'included')}
+                      onClick={() => handleManualDecision(artKey, 'included')}
                       className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer ${
                         art.status === 'included'
                           ? 'bg-emerald-600 text-white border-emerald-600'
@@ -1034,7 +1350,7 @@ export default function PrismaFlowchart({
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleManualDecision(art.pmid, 'maybe')}
+                      onClick={() => handleManualDecision(artKey, 'maybe')}
                       className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer ${
                         art.status === 'maybe'
                           ? 'bg-amber-500 text-white border-amber-500'
@@ -1045,7 +1361,7 @@ export default function PrismaFlowchart({
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleManualDecision(art.pmid, 'excluded')}
+                      onClick={() => handleManualDecision(artKey, 'excluded')}
                       className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer ${
                         art.status === 'excluded'
                           ? 'bg-rose-600 text-white border-rose-600'
@@ -1088,7 +1404,7 @@ export default function PrismaFlowchart({
                         value={resolvePrismaExclusionCategory(undefined, art.exclusionReason)}
                         onChange={e => {
                           const cat = e.target.value as PrismaExclusionCategory;
-                          handleManualDecision(art.pmid, 'excluded', PRISMA_EXCLUSION_LABELS_FR[cat]);
+                          handleManualDecision(artKey, 'excluded', PRISMA_EXCLUSION_LABELS_FR[cat]);
                         }}
                         className="rounded border border-rose-200 bg-white px-2 py-1 text-[11px] text-slate-800 shrink-0"
                       >
@@ -1106,7 +1422,7 @@ export default function PrismaFlowchart({
                 <div>
                   <button
                     type="button"
-                    onClick={() => setExpandedAbstracts(prev => ({ ...prev, [art.pmid]: !prev[art.pmid] }))}
+                    onClick={() => setExpandedAbstracts(prev => ({ ...prev, [artKey]: !prev[artKey] }))}
                     className="inline-flex items-center gap-1 text-xs font-semibold text-slate-600 hover:text-indigo-600 cursor-pointer"
                   >
                     {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
@@ -1398,22 +1714,59 @@ export default function PrismaFlowchart({
         <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-xs space-y-6">
           <div className="max-w-3xl mx-auto space-y-4">
             {/* Phase 1 : Identification */}
-            <div className="p-4 rounded-xl bg-indigo-50/50 border border-indigo-200 flex items-center justify-between">
-              <div>
+            <div className="p-4 rounded-xl bg-indigo-50/50 border border-indigo-200 flex items-center justify-between gap-4">
+              <div className="space-y-1">
                 <div className="text-[11px] font-bold uppercase tracking-wider text-indigo-700">
                   {t.step4.phase1Tag}
                 </div>
                 <div className="text-sm font-bold text-slate-900">
                   {t.step4.phase1Title}
                 </div>
-                <div className="text-xs text-slate-500">
-                  {t.step4.phase1PubmedLabel} (n = {pubmedIdentified.toLocaleString('fr-FR')}) • {t.step4.phase1OtherLabel} (n = {embaseIdentified.toLocaleString('fr-FR')})
+                <div className="text-xs text-slate-600 flex flex-wrap gap-x-2 gap-y-0.5">
+                  <span>{t.step4.phase1PubmedLabel} (n = {pubmedIdentified.toLocaleString('fr-FR')})</span>
+                  <span>• {t.step4.phase1EmbaseLabel} (n = {embaseIdentified.toLocaleString('fr-FR')})</span>
+                  {cochraneReviewsIdentified > 0 && (
+                    <span>• {t.step4.phase1CochraneReviewsLabel} (n = {cochraneReviewsIdentified.toLocaleString('fr-FR')})</span>
+                  )}
+                  {cochraneCentralIdentified > 0 && (
+                    <span>• {t.step4.phase1CochraneCentralLabel} (n = {cochraneCentralIdentified.toLocaleString('fr-FR')})</span>
+                  )}
+                  {cochraneReviewsIdentified === 0 && cochraneCentralIdentified === 0 && cochraneIdentified > 0 && (
+                    <span>• {t.step4.phase1OtherLabel} (n = {cochraneIdentified.toLocaleString('fr-FR')})</span>
+                  )}
                 </div>
+                {registersIdentified > 0 && (
+                  <div className="text-[11px] font-medium text-amber-800">
+                    {t.step4.phase1RegistersLabel} : n = {registersIdentified.toLocaleString('fr-FR')}
+                  </div>
+                )}
               </div>
-              <div className="text-xl font-bold font-mono text-indigo-700">
+              <div className="text-xl font-bold font-mono text-indigo-700 shrink-0">
                 n = {identifiedTotal.toLocaleString('fr-FR')}
               </div>
             </div>
+
+            {(duplicatesRemoved > 0 || embaseIdentified > 0 || cochraneIdentified > 0 || otherRisIdentified > 0) && (
+              <>
+                <div className="flex justify-center text-slate-300">↓</div>
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between gap-4">
+                  <div>
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                      {t.step4.phase1DedupTag}
+                    </div>
+                    <div className="text-xs font-bold text-slate-800">
+                      {t.step4.phase1DedupTitle}
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      {t.step4.phase1DedupUniqueNote.replace('{n}', totalCohort.toLocaleString('fr-FR'))}
+                    </div>
+                  </div>
+                  <div className="text-base font-bold font-mono text-slate-700 shrink-0">
+                    − {duplicatesRemoved.toLocaleString('fr-FR')}
+                  </div>
+                </div>
+              </>
+            )}
 
             <div className="flex justify-center text-slate-300">↓</div>
 
@@ -1636,17 +1989,25 @@ export default function PrismaFlowchart({
                   </thead>
                   <tbody className="divide-y divide-slate-200">
                     {paginatedRobArticles.map(art => {
-                      const rob = robEvaluations[art.pmid];
-                      const design = rob?.studyDesign || inferStudyDesignFromText(art.title, art.abstract, art.publicationTypes);
+                      const artKey = getArticleKey(art);
+                      const rob = robEvaluations[artKey] ?? (art.pmid ? robEvaluations[art.pmid] : undefined);
+                      const isRegistry = art.recordKind === 'trial_registry';
+                      const design =
+                        isRegistry
+                          ? 'other'
+                          : rob?.studyDesign ||
+                            inferStudyDesignFromText(art.title, art.abstract, art.publicationTypes, art.recordKind);
                       const isOtherFormat = design === 'other';
-                      const designTag =
-                        design === 'rct'
+                      const designTag = isRegistry
+                        ? t.step4.designRegistryTag
+                        : design === 'rct'
                           ? t.step4.designRctTag
                           : design === 'review'
                             ? t.step4.designReviewTag
                             : design === 'observational'
                               ? t.step4.designObsTag
                               : t.step4.designOtherTag;
+                      const idLabel = formatPrimaryIdentifierLabel(art);
 
                       const renderCell = (dKey: 'd1' | 'd2' | 'd3' | 'd4' | 'd5') => {
                         const val = rob?.[dKey];
@@ -1687,19 +2048,23 @@ export default function PrismaFlowchart({
                       };
 
                       return (
-                        <tr key={art.pmid} className="hover:bg-slate-50/70">
+                        <tr key={artKey} className="hover:bg-slate-50/70">
                           <td className="p-3 max-w-xs">
                             <div className="font-bold text-slate-900 line-clamp-2">{art.title}</div>
                             <div className="flex flex-wrap items-center gap-1.5 mt-1">
-                              <a
-                                href={art.url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="inline-flex items-center gap-0.5 font-mono text-[10px] text-indigo-600 hover:underline"
-                              >
-                                <span>PMID: {art.pmid}</span>
-                                <ExternalLink className="w-2.5 h-2.5" />
-                              </a>
+                              {art.url ? (
+                                <a
+                                  href={art.url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-0.5 font-mono text-[10px] text-indigo-600 hover:underline"
+                                >
+                                  <span>{idLabel}</span>
+                                  <ExternalLink className="w-2.5 h-2.5" />
+                                </a>
+                              ) : (
+                                <span className="font-mono text-[10px] text-slate-600">{idLabel}</span>
+                              )}
                               <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 text-[10px] font-semibold">
                                 {designTag}
                               </span>
@@ -1720,7 +2085,7 @@ export default function PrismaFlowchart({
 
                           {isOtherFormat ? (
                             <td colSpan={5} className="p-3 text-center text-[11px] text-slate-500 italic bg-slate-50/50">
-                              {t.step4.robNaNote}
+                              {isRegistry ? t.step4.robRegistryNaNote : t.step4.robNaNote}
                             </td>
                           ) : (
                             <>
@@ -1815,21 +2180,25 @@ export default function PrismaFlowchart({
                   </thead>
                   <tbody className="divide-y divide-slate-200">
                     {paginatedMatrixRows.map(row => (
-                      <tr key={row.pmid} className="hover:bg-slate-50/80">
+                      <tr key={row.recordId} className="hover:bg-slate-50/80">
                         <td className="p-3 align-top max-w-xs">
                           <div className="font-bold text-slate-900">{row.firstAuthorYear}</div>
                           <div className="text-[11px] text-slate-600 line-clamp-2 mt-0.5">{row.title}</div>
                           <div className="flex flex-wrap items-center gap-2 mt-1">
                             <span className="text-[11px] text-slate-500">{row.journal}</span>
-                            <a
-                              href={row.url}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="inline-flex items-center gap-0.5 font-mono text-[10px] text-indigo-600 hover:underline"
-                            >
-                              <span>PMID: {row.pmid}</span>
-                              <ExternalLink className="w-2.5 h-2.5" />
-                            </a>
+                            {row.url ? (
+                              <a
+                                href={row.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center gap-0.5 font-mono text-[10px] text-indigo-600 hover:underline"
+                              >
+                                <span>{row.identifierLabel}</span>
+                                <ExternalLink className="w-2.5 h-2.5" />
+                              </a>
+                            ) : (
+                              <span className="font-mono text-[10px] text-slate-600">{row.identifierLabel}</span>
+                            )}
                           </div>
                         </td>
                         <td className="p-3 align-top space-y-1.5">
@@ -1952,19 +2321,25 @@ export default function PrismaFlowchart({
                   </thead>
                   <tbody className="divide-y divide-slate-200">
                     {readingMatrixRows.slice(0, 5).map(row => (
-                      <tr key={row.pmid} className="hover:bg-slate-50/70">
+                      <tr key={row.recordId} className="hover:bg-slate-50/70">
                         <td className="p-2.5 align-top max-w-[200px]">
                           <div className="font-semibold text-slate-900">{row.firstAuthorYear}</div>
                           <div className="text-[11px] text-slate-500 truncate">{row.journal}</div>
-                          <a
-                            href={row.url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex items-center gap-0.5 font-mono text-[10px] text-indigo-600 hover:underline mt-0.5"
-                          >
-                            <span>PMID: {row.pmid}</span>
-                            <ExternalLink className="w-2.5 h-2.5" />
-                          </a>
+                          {row.url ? (
+                            <a
+                              href={row.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-0.5 font-mono text-[10px] text-indigo-600 hover:underline mt-0.5"
+                            >
+                              <span>{row.identifierLabel}</span>
+                              <ExternalLink className="w-2.5 h-2.5" />
+                            </a>
+                          ) : (
+                            <span className="font-mono text-[10px] text-slate-600 mt-0.5 inline-block">
+                              {row.identifierLabel}
+                            </span>
+                          )}
                         </td>
                         <td className="p-2.5 align-top">
                           <div className="text-[11px] font-medium text-slate-800">{row.studyDesignLabel}</div>

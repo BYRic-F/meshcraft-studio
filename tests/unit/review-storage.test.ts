@@ -204,7 +204,7 @@ describe('Service de persistance complète des revues (reviewStorageService)', (
       expect(parsed.snapshot.resultData?.pubmedQuery).toContain('"Heart Failure"[Mesh]');
       expect(parsed.snapshot.screenedArticles).toHaveLength(2);
       expect(parsed.snapshot.screenedArticles[0].status).toBe('included');
-      expect(parsed.snapshot.robEvaluations['40111222']?.overall).toBe('low');
+      expect(parsed.snapshot.robEvaluations['pmid:40111222']?.overall).toBe('low');
     }
   });
 
@@ -241,7 +241,9 @@ describe('Service de persistance complète des revues (reviewStorageService)', (
       expect(parsed.snapshot.screenedArticles[0].identifiers?.doi).toBe('10.1056/nejmoa2107038');
       expect(parsed.snapshot.screenedArticles[0].recordKind).toBe('article');
       expect(parsed.snapshot.screenedArticles[0].status).toBe('included');
-      expect(parsed.snapshot.robEvaluations['40111222']?.overall).toBe('low');
+      expect(parsed.snapshot.robEvaluations['40111222']).toBeUndefined();
+      expect(parsed.snapshot.robEvaluations['pmid:40111222']?.overall).toBe('low');
+      expect(parsed.snapshot.robEvaluations['pmid:40111222']?.recordId).toBe('pmid:40111222');
 
       const withMultiBase = await saveReview({
         ...parsed.snapshot,

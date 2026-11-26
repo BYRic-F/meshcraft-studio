@@ -178,6 +178,22 @@ export interface TranslationDictionary {
     readonly cochranePrecautionNote: string;
     readonly backToStep2: string;
     readonly goToStep4: string;
+    readonly multiBaseImportTitle: string;
+    readonly multiBaseImportBtn: string;
+    readonly multiBaseImportHint: string;
+    readonly multiBaseImportEmpty: string;
+    readonly multiBaseImportDuplicate: string;
+    readonly multiBaseImportSuccess: string;
+    readonly sourceAllLabel: string;
+    readonly sourcePubmedLabel: string;
+    readonly sourceEmbaseLabel: string;
+    readonly sourceCochraneReviewsLabel: string;
+    readonly sourceCochraneCentralLabel: string;
+    readonly sourceOtherRisLabel: string;
+    readonly trialRegistryFilterLabel: string;
+    readonly trialRegistryBadge: string;
+    readonly trialRegistryAuthorsFallback: string;
+    readonly dedupSummaryBanner: string;
   };
   readonly step4: {
     readonly badge: string;
@@ -199,6 +215,15 @@ export interface TranslationDictionary {
     readonly phase1Title: string;
     readonly phase1PubmedLabel: string;
     readonly phase1OtherLabel: string;
+    readonly phase1EmbaseLabel: string;
+    readonly phase1CochraneReviewsLabel: string;
+    readonly phase1CochraneCentralLabel: string;
+    readonly phase1RegistersLabel: string;
+    readonly phase1DedupTag: string;
+    readonly phase1DedupTitle: string;
+    readonly phase1DedupUniqueNote: string;
+    readonly robRegistryNaNote: string;
+    readonly designRegistryTag: string;
     readonly phase2Tag: string;
     readonly phase2Title: string;
     readonly phase2CappedNote: string;
@@ -495,7 +520,7 @@ export const frDictionary: TranslationDictionary = {
     filterMaybe: 'À vérifier',
     filterExcluded: 'Exclues',
     filterPending: 'En attente',
-    searchPlaceholder: 'Filtrer par titre, auteur ou PMID...',
+    searchPlaceholder: 'Filtrer par titre, auteur, PMID, DOI ou ID...',
     runAiScreeningBtn: 'Pré-dépouiller par IA',
     runAiNext50Btn: 'Pré-dépouiller les {n} notices en attente suivantes',
     runAiAllPendingBtn: 'Tout pré-dépouiller ({n})',
@@ -538,7 +563,7 @@ export const frDictionary: TranslationDictionary = {
       'Modèle préclinique (animal ou in vitro)',
       'Autre motif d\'exclusion'
     ],
-    noAbstractFallback: 'Aucun résumé disponible dans PubMed pour cette référence.',
+    noAbstractFallback: 'Aucun résumé disponible dans cette notice.',
     manualNoteIncluded: 'Inclus manuellement par le lecteur.',
     manualNoteMaybe: 'Retenu manuellement pour vérification sur texte intégral.',
     manualNoteExcludedPrefix: 'Exclu manuellement : ',
@@ -551,7 +576,23 @@ export const frDictionary: TranslationDictionary = {
     hideAbstract: 'Masquer le résumé',
     cochranePrecautionNote: 'L\'IA agit comme co-lecteur préparatoire : la décision finale d\'inclusion repose sur la double lecture humaine du texte intégral.',
     backToStep2: '← Retour aux équations',
-    goToStep4: 'Accéder au Bilan PRISMA, Biais & Matrice →'
+    goToStep4: 'Accéder au Bilan PRISMA, Biais & Matrice →',
+    multiBaseImportTitle: 'Import multi-bases (.ris Cochrane / Embase)',
+    multiBaseImportBtn: 'Importer .ris',
+    multiBaseImportHint: 'Cochrane Reviews, CENTRAL ou Embase (déduplication automatique par fusion)',
+    multiBaseImportEmpty: 'Aucune notice RIS exploitable détectée dans {file}.',
+    multiBaseImportDuplicate: 'Fichier déjà importé dans ce corpus (aucun doublon ajouté).',
+    multiBaseImportSuccess: '{added} nouvelle(s) notice(s) ajoutée(s) et {merged} doublon(s) fusionné(s) depuis {source}.',
+    sourceAllLabel: 'Toutes sources',
+    sourcePubmedLabel: 'PubMed',
+    sourceEmbaseLabel: 'Embase',
+    sourceCochraneReviewsLabel: 'Cochrane Reviews',
+    sourceCochraneCentralLabel: 'CENTRAL',
+    sourceOtherRisLabel: 'RIS',
+    trialRegistryFilterLabel: 'Registres d\'essais',
+    trialRegistryBadge: 'Registre d\'essai',
+    trialRegistryAuthorsFallback: 'Enregistrement de protocole (registre)',
+    dedupSummaryBanner: '{total} identifiées → {dups} doublon(s) retiré(s) → {unique} notices uniques'
   },
   step4: {
     badge: 'Étape 4 sur 4 · Synthèse, biais et export thèse',
@@ -573,6 +614,15 @@ export const frDictionary: TranslationDictionary = {
     phase1Title: 'Références identifiées dans les bases de données',
     phase1PubmedLabel: 'PubMed/MEDLINE',
     phase1OtherLabel: 'Autres bases',
+    phase1EmbaseLabel: 'Embase',
+    phase1CochraneReviewsLabel: 'Cochrane Reviews',
+    phase1CochraneCentralLabel: 'Cochrane CENTRAL',
+    phase1RegistersLabel: 'Dont registres d\'essais',
+    phase1DedupTag: 'Dédoublonnage multi-bases',
+    phase1DedupTitle: 'Doublons retirés avant dépouillement',
+    phase1DedupUniqueNote: '{n} notices uniques prêtes pour le screening',
+    robRegistryNaNote: 'Enregistrement de protocole de registre sans résultats publiés (hors grille RoB).',
+    designRegistryTag: 'Registre (N/A)',
     phase2Tag: '2. Sélection (screening)',
     phase2Title: 'Notices examinées sur titre et résumé',
     phase2CappedNote: 'Aperçu chargé dans l\'outil : {loaded} / {total} notices PubMed',
@@ -618,7 +668,7 @@ export const frDictionary: TranslationDictionary = {
     designOtherTag: 'Autre (Hors grille)',
     matrixTitle: 'Matrice de synthèse des études',
     matrixSubtitle: 'Tableau consolidé par étude (référence, plan d\'étude, synthèse titre/résumé et risque de biais).',
-    matrixColStudy: 'Étude (Auteur, Année, Revue, PMID)',
+    matrixColStudy: 'Étude (Auteur, Année, Revue, Référence)',
     matrixColDesignStatus: 'Plan d\'étude & statut',
     matrixColSummary: 'Synthèse titre/résumé',
     matrixColRob: 'Risque de biais',
@@ -869,7 +919,7 @@ export const enDictionary: TranslationDictionary = {
     filterMaybe: 'Maybe',
     filterExcluded: 'Excluded',
     filterPending: 'Pending',
-    searchPlaceholder: 'Filter by title, author, or PMID...',
+    searchPlaceholder: 'Filter by title, author, PMID, DOI or ID...',
     runAiScreeningBtn: 'Run AI pre-screening',
     runAiNext50Btn: 'Pre-screen next {n} pending records',
     runAiAllPendingBtn: 'Pre-screen all ({n})',
@@ -912,7 +962,7 @@ export const enDictionary: TranslationDictionary = {
       'Preclinical model (animal or in vitro)',
       'Other exclusion reason'
     ],
-    noAbstractFallback: 'No abstract available in PubMed for this record.',
+    noAbstractFallback: 'No abstract available for this record.',
     manualNoteIncluded: 'Manually included by reviewer.',
     manualNoteMaybe: 'Manually marked for full-text check.',
     manualNoteExcludedPrefix: 'Manually excluded: ',
@@ -925,7 +975,23 @@ export const enDictionary: TranslationDictionary = {
     hideAbstract: 'Hide abstract',
     cochranePrecautionNote: 'AI acts as a preparatory co-screener: final inclusion relies on independent human full-text review.',
     backToStep2: '← Back to Equations',
-    goToStep4: 'Open PRISMA Flowchart, Bias & Matrix →'
+    goToStep4: 'Open PRISMA Flowchart, Bias & Matrix →',
+    multiBaseImportTitle: 'Multi-database import (.ris Cochrane / Embase)',
+    multiBaseImportBtn: 'Import .ris',
+    multiBaseImportHint: 'Cochrane Reviews, CENTRAL or Embase (automatic merge deduplication)',
+    multiBaseImportEmpty: 'No valid RIS records found in {file}.',
+    multiBaseImportDuplicate: 'File already imported in this corpus (no duplicates added).',
+    multiBaseImportSuccess: 'Added {added} new record(s) and merged {merged} duplicate(s) from {source}.',
+    sourceAllLabel: 'All sources',
+    sourcePubmedLabel: 'PubMed',
+    sourceEmbaseLabel: 'Embase',
+    sourceCochraneReviewsLabel: 'Cochrane Reviews',
+    sourceCochraneCentralLabel: 'CENTRAL',
+    sourceOtherRisLabel: 'RIS',
+    trialRegistryFilterLabel: 'Trial registries',
+    trialRegistryBadge: 'Trial registry',
+    trialRegistryAuthorsFallback: 'Trial registry record (protocol)',
+    dedupSummaryBanner: '{total} identified → {dups} duplicate(s) removed → {unique} unique records'
   },
   step4: {
     badge: 'Step 4 of 4 · Synthesis, bias and thesis export',
@@ -947,6 +1013,15 @@ export const enDictionary: TranslationDictionary = {
     phase1Title: 'Records identified from databases',
     phase1PubmedLabel: 'PubMed/MEDLINE',
     phase1OtherLabel: 'Other databases',
+    phase1EmbaseLabel: 'Embase',
+    phase1CochraneReviewsLabel: 'Cochrane Reviews',
+    phase1CochraneCentralLabel: 'Cochrane CENTRAL',
+    phase1RegistersLabel: 'Trial registers included',
+    phase1DedupTag: 'Multi-database deduplication',
+    phase1DedupTitle: 'Duplicates removed before screening',
+    phase1DedupUniqueNote: '{n} unique records ready for screening',
+    robRegistryNaNote: 'Trial registry record without published results (outside RoB checklist).',
+    designRegistryTag: 'Registry (N/A)',
     phase2Tag: '2. Screening',
     phase2Title: 'Records screened on title and abstract',
     phase2CappedNote: 'Preview loaded in tool: {loaded} / {total} PubMed records',
@@ -992,7 +1067,7 @@ export const enDictionary: TranslationDictionary = {
     designOtherTag: 'Other (N/A)',
     matrixTitle: 'Study synthesis matrix',
     matrixSubtitle: 'Per-study consolidated table (reference, study design, title/abstract synthesis and risk of bias).',
-    matrixColStudy: 'Study (Author, Year, Journal, PMID)',
+    matrixColStudy: 'Study (Author, Year, Journal, Reference)',
     matrixColDesignStatus: 'Study design & status',
     matrixColSummary: 'Title/abstract synthesis',
     matrixColRob: 'Risk of bias',

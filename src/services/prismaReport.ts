@@ -4,11 +4,19 @@
  * et aux exigences des revues systématiques de la littérature.
  */
 
+import type { CorpusDeduplicationStats } from './studyRecordTypes';
+
 export interface PrismaFlowData {
   identification: {
     pubmedHits: number;
     embaseEstimatedHits: number;
     cochraneEstimatedHits: number;
+    cochraneReviewsHits?: number;
+    cochraneCentralHits?: number;
+    otherRisHits?: number;
+    registersHits?: number;
+    databasesTotal?: number;
+    uniqueRecordsAfterDedup?: number;
     totalIdentified: number;
     duplicatesRemoved: number;
   };
@@ -35,9 +43,23 @@ export function generatePrismaSummaryData(
   liveResult: { readonly count?: number } | null | undefined,
   mappedBlocks: readonly unknown[],
   _pico?: { p: string; i: string; c: string; o: string },
-  customScreenedArticles?: ScreenedArticle[]
+  customScreenedArticles?: ScreenedArticle[],
+  deduplicationStats?: CorpusDeduplicationStats
 ): PrismaFlowData {
-  const pubmedHits = liveResult?.count || 0;
+  const pubmedRaw = deduplicationStats?.rawBySource.pubmed ?? 0;
+  const pubmedHits = Math.max(liveResult?.count || 0, pubmedRaw);
+  const embaseHits = deduplicationStats?.rawBySource.embase ?? 0;
+  const cochraneReviewsHits = deduplicationStats?.rawBySource.cochrane_reviews ?? 0;
+  const cochraneCentralHits = deduplicationStats?.rawBySource.cochrane_central ?? 0;
+  const cochraneHits = cochraneReviewsHits + cochraneCentralHits;
+  const otherRisHits = deduplicationStats?.rawBySource.other_ris ?? 0;
+  const registersHits = deduplicationStats?.totalIdentifiedRegisters ?? 0;
+  const duplicatesRemoved = deduplicationStats?.duplicatesRemoved ?? 0;
+  const totalIdentified = pubmedHits + embaseHits + cochraneHits + otherRisHits;
+  const databasesTotal = Math.max(0, totalIdentified - registersHits);
+  const uniqueRecordsAfterDedup =
+    deduplicationStats?.uniqueCorpusCount ??
+    (customScreenedArticles ? customScreenedArticles.length : pubmedHits);
   const meshCount = mappedBlocks?.length || 0;
 
   // Si l'IA ou le lecteur a dépouillé des articles
@@ -47,10 +69,16 @@ export function generatePrismaSummaryData(
     return {
       identification: {
         pubmedHits,
-        embaseEstimatedHits: 0,
-        cochraneEstimatedHits: 0,
-        totalIdentified: pubmedHits,
-        duplicatesRemoved: 0,
+        embaseEstimatedHits: embaseHits,
+        cochraneEstimatedHits: cochraneHits,
+        cochraneReviewsHits,
+        cochraneCentralHits,
+        otherRisHits,
+        registersHits,
+        databasesTotal,
+        uniqueRecordsAfterDedup,
+        totalIdentified,
+        duplicatesRemoved,
       },
       screening: {
         recordsScreened: metrics.totalScreened,
@@ -77,10 +105,16 @@ export function generatePrismaSummaryData(
   return {
     identification: {
       pubmedHits,
-      embaseEstimatedHits: 0,
-      cochraneEstimatedHits: 0,
-      totalIdentified: pubmedHits,
-      duplicatesRemoved: 0,
+      embaseEstimatedHits: embaseHits,
+      cochraneEstimatedHits: cochraneHits,
+      cochraneReviewsHits,
+      cochraneCentralHits,
+      otherRisHits,
+      registersHits,
+      databasesTotal,
+      uniqueRecordsAfterDedup,
+      totalIdentified,
+      duplicatesRemoved,
     },
     screening: {
       recordsScreened: 0,
@@ -125,31 +159,65 @@ export function generateThesisMethodologyText(
     ? `\n\nÉquation de recherche Cochrane CENTRAL :\n${cochraneQuery}`
     : '';
 
+  const hasPubmed = prisma.identification.pubmedHits > 0;
   const hasEmbase = prisma.identification.embaseEstimatedHits > 0;
   const hasCochrane = prisma.identification.cochraneEstimatedHits > 0;
+  const hasOtherRis = (prisma.identification.otherRisHits ?? 0) > 0;
+  const registersHits = prisma.identification.registersHits ?? 0;
 
   let databasesParagraph = '';
-  if (!hasEmbase && !hasCochrane) {
+  if (!hasEmbase && !hasCochrane && !hasOtherRis) {
     databasesParagraph =
       "La base de données PubMed / MEDLINE (National Library of Medicine) a été interrogée. L'équation combine les descripteurs contrôlés MeSH et les termes libres correspondants dans le titre et le résumé [TiAb], reliés par les opérateurs booléens AND, OR et NOT. Les équations traduites pour Embase (Elsevier) et Cochrane CENTRAL sont fournies ci-dessous pour une extension multi-bases.";
   } else {
     const queriedDbs = [
-      'PubMed / MEDLINE (National Library of Medicine)',
+      ...(hasPubmed ? ['PubMed / MEDLINE (National Library of Medicine)'] : []),
       ...(hasEmbase ? ['Embase (Elsevier)'] : []),
-      ...(hasCochrane ? ['Cochrane CENTRAL'] : [])
+      ...(hasCochrane ? ['Cochrane Library (Reviews & CENTRAL)'] : []),
+      ...(hasOtherRis ? ['Imports bibliographiques complémentaires (.ris)'] : [])
     ];
     const joinedDbs =
-      queriedDbs.length === 2
-        ? `${queriedDbs[0]} et ${queriedDbs[1]}`
-        : `${queriedDbs.slice(0, -1).join(', ')} et ${queriedDbs[queriedDbs.length - 1]}`;
+      queriedDbs.length <= 1
+        ? queriedDbs[0] || 'PubMed / MEDLINE (National Library of Medicine)'
+        : queriedDbs.length === 2
+          ? `${queriedDbs[0]} et ${queriedDbs[1]}`
+          : `${queriedDbs.slice(0, -1).join(', ')} et ${queriedDbs[queriedDbs.length - 1]}`;
     const remainingNote =
       !hasEmbase
         ? " L'équation traduite pour Embase (Elsevier) est fournie ci-dessous pour une extension ultérieure."
         : !hasCochrane
           ? " L'équation traduite pour Cochrane CENTRAL est fournie ci-dessous pour une extension ultérieure."
           : '';
-    databasesParagraph = `Les bases de données ${joinedDbs} ont été interrogées. Les équations combinent les descripteurs contrôlés (MeSH pour PubMed${hasEmbase ? ', Emtree pour Embase' : ''}) et les termes libres correspondants dans le titre et le résumé [TiAb], reliés par les opérateurs booléens AND, OR et NOT.${remainingNote}`;
+    databasesParagraph = `Les bases de données ${joinedDbs} ont été interrogées. Les équations combinent les descripteurs contrôlés (MeSH pour PubMed/Cochrane${hasEmbase ? ', Emtree pour Embase' : ''}) et les termes libres correspondants dans le titre et le résumé [TiAb], reliés par les opérateurs booléens AND, OR et NOT.${remainingNote}`;
   }
+
+  const identificationDetailLines: string[] = [
+    `   - PubMed / MEDLINE : ${prisma.identification.pubmedHits.toLocaleString('fr-FR')} références`,
+    `   - Embase (Elsevier) : ${prisma.identification.embaseEstimatedHits.toLocaleString('fr-FR')} références`
+  ];
+  if ((prisma.identification.cochraneReviewsHits ?? 0) > 0 || (prisma.identification.cochraneCentralHits ?? 0) > 0) {
+    identificationDetailLines.push(
+      `   - Cochrane Reviews : ${(prisma.identification.cochraneReviewsHits ?? 0).toLocaleString('fr-FR')} références`,
+      `   - Cochrane CENTRAL : ${(prisma.identification.cochraneCentralHits ?? 0).toLocaleString('fr-FR')} références`
+    );
+  } else {
+    identificationDetailLines.push(
+      `   - Cochrane Library : ${prisma.identification.cochraneEstimatedHits.toLocaleString('fr-FR')} références`
+    );
+  }
+  if (hasOtherRis) {
+    identificationDetailLines.push(
+      `   - Autres sources RIS : ${(prisma.identification.otherRisHits ?? 0).toLocaleString('fr-FR')} références`
+    );
+  }
+  if (registersHits > 0) {
+    identificationDetailLines.push(
+      `   - Ventilation PRISMA 2020 : ${(prisma.identification.databasesTotal ?? Math.max(0, prisma.identification.totalIdentified - registersHits)).toLocaleString('fr-FR')} en bases de données + ${registersHits.toLocaleString('fr-FR')} en registres d'essais`
+    );
+  }
+  identificationDetailLines.push(
+    `   - Total brut identifié : ${prisma.identification.totalIdentified.toLocaleString('fr-FR')} références`
+  );
 
   return `========================================================================
 CHAPITRE : MATÉRIEL ET MÉTHODES — REVUE SYSTÉMATIQUE DE LA LITTÉRATURE
@@ -203,10 +271,7 @@ D. PROCESSUS DE SÉLECTION & DIAGRAMME DE FLUX PRISMA 2020
 ------------------------------------------------------------------------
 La sélection des études a suivi les recommandations PRISMA 2020 :
 1. Identification :
-   - PubMed : ${prisma.identification.pubmedHits.toLocaleString('fr-FR')} références
-   - Embase (estimation) : ${prisma.identification.embaseEstimatedHits.toLocaleString('fr-FR')} références
-   - Cochrane Library (estimation) : ${prisma.identification.cochraneEstimatedHits.toLocaleString('fr-FR')} références
-   - Total identifié : ${prisma.identification.totalIdentified.toLocaleString('fr-FR')} références
+${identificationDetailLines.join('\n')}
 2. Dédoublonnage :
    - ${prisma.identification.duplicatesRemoved.toLocaleString('fr-FR')} doublons éliminés
 3. Sélection sur titre et résumé (Screening) :
@@ -233,6 +298,11 @@ export interface PrismaReportStatsInput {
   readonly identifiedTotal: number;
   readonly pubmedCount: number;
   readonly embaseCount: number;
+  readonly cochraneCount?: number;
+  readonly cochraneReviewsCount?: number;
+  readonly cochraneCentralCount?: number;
+  readonly otherRisCount?: number;
+  readonly registersCount?: number;
   readonly duplicatesRemoved: number;
   readonly screened: number;
   readonly excludedScreening: number;
@@ -267,11 +337,23 @@ export function generatePrismaReportText(
     count: item.count
   }));
 
+  const cochraneReviewsHits = stats.cochraneReviewsCount ?? 0;
+  const cochraneCentralHits = stats.cochraneCentralCount ?? 0;
+  const cochraneEstimatedHits = stats.cochraneCount ?? (cochraneReviewsHits + cochraneCentralHits);
+  const otherRisHits = stats.otherRisCount ?? 0;
+  const registersHits = stats.registersCount ?? 0;
+  const databasesTotal = Math.max(0, stats.identifiedTotal - registersHits);
+
   const prismaData: PrismaFlowData = {
     identification: {
       pubmedHits: stats.pubmedCount,
       embaseEstimatedHits: stats.embaseCount,
-      cochraneEstimatedHits: 0, // Zéro extrapolation : à saisir par le candidat s'il a accès à Cochrane
+      cochraneEstimatedHits,
+      cochraneReviewsHits,
+      cochraneCentralHits,
+      otherRisHits,
+      registersHits,
+      databasesTotal,
       totalIdentified: stats.identifiedTotal,
       duplicatesRemoved: stats.duplicatesRemoved
     },
@@ -297,6 +379,16 @@ export function generatePrismaReportText(
     ? `\n${exclusionBreakdown.slice(0, 5).map(b => `   - ${b.reason} (n = ${b.count})`).join('\n')}`
     : '';
 
+  const sourceSummaryLines = [
+    `   - PubMed : ${stats.pubmedCount}`,
+    `   - Embase : ${stats.embaseCount}`,
+    ...(cochraneEstimatedHits > 0
+      ? [`   - Cochrane Library : ${cochraneEstimatedHits} (Reviews: ${cochraneReviewsHits}, CENTRAL: ${cochraneCentralHits})`]
+      : []),
+    ...(otherRisHits > 0 ? [`   - Autres sources RIS : ${otherRisHits}`] : []),
+    ...(registersHits > 0 ? [`   - Dont registres d'essais : ${registersHits}`] : [])
+  ].join('\n');
+
   return `========================================================================
 RAPPORT MÉTHODOLOGIQUE PRISMA 2020 — REVUE SYSTÉMATIQUE DE LA LITTÉRATURE
 ========================================================================
@@ -306,8 +398,7 @@ ${pubmedQuery}
 
 FLUX DE SÉLECTION DÉTAILLÉ :
 1. Références identifiées au total : ${stats.identifiedTotal}
-   - PubMed : ${stats.pubmedCount}
-   - Embase : ${stats.embaseCount}
+${sourceSummaryLines}
 2. Doublons retirés : ${stats.duplicatesRemoved}
 3. Références examinées sur titre/résumé : ${stats.screened}
 4. Références exclues sur titre/résumé : ${stats.excludedScreening}${topReasonsBlock}

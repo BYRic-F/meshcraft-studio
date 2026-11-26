@@ -1371,7 +1371,7 @@ describe('1. Tests Unitaires & Conformité Constitutionnelle (gemini.md)', () =>
       expect(csv).not.toContain('Population & Exposition');
 
       const md = exportReadingMatrixMarkdown(rowsWithMaybe);
-      expect(md).toContain('| PMID | Auteur (Année) | Plan d\'étude & Statut | Synthèse titre/résumé | Risque de biais |');
+      expect(md).toContain('| Référence | Auteur (Année) | Plan d\'étude & Statut | Synthèse titre/résumé | Risque de biais |');
       expect(md).toContain('34567890');
       expect(md).not.toContain('Population & Exposition');
       expect(md).not.toMatch(/[🟢🟡🔴⚪]/u);

@@ -53,6 +53,7 @@ export interface SourceImportBatch {
   readonly batchId: string;
   readonly source: BibliographicSource;
   readonly fileName?: string;
+  readonly contentHash?: string;
   readonly importedAt: number;
   readonly rawRecordCount: number;
   readonly registryRecordCount: number;
@@ -333,4 +334,40 @@ export function createEmptySourceCounts(): Record<BibliographicSource, number> {
     cochrane_central: 0,
     other_ris: 0
   };
+}
+
+/**
+ * Retourne la clé primaire canonique d'une notice (priorité `id`, sinon `pmid:<digits>`, sinon `pmid` brut).
+ */
+export function getArticleKey(art: {
+  readonly id?: string;
+  readonly pmid?: string;
+  readonly identifiers?: StudyIdentifiers;
+}): string {
+  if (typeof art.id === 'string' && art.id.trim().length > 0) {
+    return art.id.trim();
+  }
+  const normPmid = normalizePmid(art.identifiers?.pmid ?? art.pmid);
+  if (normPmid) {
+    return `pmid:${normPmid}`;
+  }
+  return (art.pmid || '').trim();
+}
+
+/**
+ * Calcule une empreinte 64-bit déterministe du contenu brut normalisé d'un fichier RIS
+ * afin de garantir l'idempotence en cas de réimportation du même fichier.
+ */
+export function computeContentFingerprint(rawText: string): string {
+  const normalized = (rawText || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trim();
+  let h1 = 0x811c9dc5;
+  let h2 = 0x811c9dc5 ^ 0x9e3779b9;
+  for (let i = 0; i < normalized.length; i++) {
+    const code = normalized.charCodeAt(i);
+    h1 ^= code;
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 ^= (code + (i & 0xff)) & 0xffff;
+    h2 = Math.imul(h2, 0x01000193) >>> 0;
+  }
+  return `${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
 }

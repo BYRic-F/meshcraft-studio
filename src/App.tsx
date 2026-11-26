@@ -32,6 +32,7 @@ import {
   Rob2ArticleEvaluation
 } from './services/localAiService';
 import type { ScreenedArticle } from './services/agentScreener';
+import type { CorpusDeduplicationStats, SourceImportBatch } from './services/studyRecordTypes';
 import {
   SavedReviewSnapshot,
   listReviews,
@@ -113,6 +114,10 @@ function MeSHcraftStudioShell() {
   const [resultData, setResultData] = useState<PipelineResultData | null>(null);
   const [screenedArticles, setScreenedArticles] = useState<ScreenedArticle[]>([]);
   const [robEvaluations, setRobEvaluations] = useState<Record<string, Rob2ArticleEvaluation>>({});
+  const [importBatches, setImportBatches] = useState<SourceImportBatch[]>([]);
+  const [deduplicationStats, setDeduplicationStats] = useState<CorpusDeduplicationStats | undefined>(
+    undefined
+  );
   const [hydratedQuery, setHydratedQuery] = useState<string>('');
 
   const [activeReviewId, setActiveReviewId] = useState<string | null>(null);
@@ -153,6 +158,8 @@ function MeSHcraftStudioShell() {
       setResultData(result);
       setScreenedArticles([]);
       setRobEvaluations({});
+      setImportBatches([]);
+      setDeduplicationStats(undefined);
       setHydratedQuery('');
       setCurrentStep(6);
       setWizardStep(2);
@@ -367,6 +374,8 @@ function MeSHcraftStudioShell() {
       if (queryChanged) {
         setScreenedArticles([]);
         setRobEvaluations({});
+        setImportBatches([]);
+        setDeduplicationStats(undefined);
         setHydratedQuery('');
       }
     } catch (err: unknown) {
@@ -393,7 +402,7 @@ function MeSHcraftStudioShell() {
       const title =
         (titleOverride || activeReviewTitle || '').trim() || buildDefaultReviewTitle(picoInputs);
       return {
-        schemaVersion: 1,
+        schemaVersion: 2,
         id,
         title,
         createdAt: existingCreatedAt ?? now,
@@ -405,7 +414,9 @@ function MeSHcraftStudioShell() {
         resultData,
         refinementCount,
         screenedArticles,
-        robEvaluations
+        robEvaluations,
+        ...(importBatches.length > 0 ? { importBatches: [...importBatches] } : {}),
+        ...(deduplicationStats ? { deduplicationStats } : {})
       };
     },
     [
@@ -415,6 +426,8 @@ function MeSHcraftStudioShell() {
       resultData,
       screenedArticles,
       robEvaluations,
+      importBatches,
+      deduplicationStats,
       settings,
       refinementCount
     ]
@@ -427,6 +440,8 @@ function MeSHcraftStudioShell() {
     setRefinementCount(snapshot.refinementCount || 0);
     setScreenedArticles([...snapshot.screenedArticles]);
     setRobEvaluations({ ...snapshot.robEvaluations });
+    setImportBatches(snapshot.importBatches ? [...snapshot.importBatches] : []);
+    setDeduplicationStats(snapshot.deduplicationStats);
     const restoredQuery = (snapshot.resultData?.pubmedQuery || '').trim();
     setHydratedQuery(snapshot.screenedArticles.length > 0 && restoredQuery ? restoredQuery : '');
     setWizardStep(snapshot.resultData ? snapshot.wizardStep : 1);
@@ -483,6 +498,8 @@ function MeSHcraftStudioShell() {
     refinementCount,
     screenedArticles,
     robEvaluations,
+    importBatches,
+    deduplicationStats,
     wizardStep,
     buildSnapshotPayload
   ]);
@@ -530,6 +547,8 @@ function MeSHcraftStudioShell() {
     setResultData(null);
     setScreenedArticles([]);
     setRobEvaluations({});
+    setImportBatches([]);
+    setDeduplicationStats(undefined);
     setHydratedQuery('');
     setRefinementCount(0);
     setActiveReviewId(null);
@@ -543,7 +562,13 @@ function MeSHcraftStudioShell() {
   const canSaveCurrent = hasMeaningfulDraftContent(picoInputs, resultData);
   const isCurrentSaved = Boolean(justSavedStep2 || (activeReviewId && savedReviews.some(r => r.id === activeReviewId)));
   const prismaData = resultData
-    ? generatePrismaSummaryData(resultData.liveResult, resultData.mappedBlocks, picoInputs, screenedArticles)
+    ? generatePrismaSummaryData(
+        resultData.liveResult,
+        resultData.mappedBlocks,
+        picoInputs,
+        screenedArticles,
+        deduplicationStats
+      )
     : null;
 
   return (
@@ -643,6 +668,10 @@ function MeSHcraftStudioShell() {
               onScreenedArticlesChange={setScreenedArticles}
               robEvaluations={robEvaluations}
               onRobEvaluationsChange={setRobEvaluations}
+              importBatches={importBatches}
+              onImportBatchesChange={setImportBatches}
+              deduplicationStats={deduplicationStats}
+              onDeduplicationStatsChange={setDeduplicationStats}
               hydratedForQuery={hydratedQuery}
               onCorpusLoadedForQuery={setHydratedQuery}
               isActive={wizardStep === 3}

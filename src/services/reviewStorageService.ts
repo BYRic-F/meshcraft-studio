@@ -261,15 +261,60 @@ export function hydrateLegacyScreenedArticle(raw: ScreenedArticle): CanonicalStu
   };
 }
 
+/**
+ * Remappe les clés d'évaluations RoB 2 d'anciennes sauvegardes v1.0.2 (ex: "29773696")
+ * vers la clé canonique `art.id` correspondante (ex: "pmid:29773696") sans laisser de clé orpheline.
+ */
+export function remapRobEvaluationsToCanonicalIds(
+  rawRob: Readonly<Record<string, Rob2ArticleEvaluation>>,
+  hydratedArticles: readonly CanonicalStudyRecord[]
+): Record<string, Rob2ArticleEvaluation> {
+  const validCanonicalIds = new Set<string>(hydratedArticles.map(a => a.id));
+  const pmidToId = new Map<string, string>();
+  for (const art of hydratedArticles) {
+    const pmid = normalizePmid(art.identifiers.pmid ?? art.pmid);
+    if (pmid && !pmidToId.has(pmid)) {
+      pmidToId.set(pmid, art.id);
+    }
+  }
+
+  const CANONICAL_PREFIX_RE = /^(?:pmid|doi|cochrane|embase|registry|fp):/i;
+  const remapped: Record<string, Rob2ArticleEvaluation> = {};
+
+  for (const [rawKey, evaluation] of Object.entries(rawRob || {})) {
+    if (!evaluation || typeof evaluation !== 'object') continue;
+    const cleanKey = rawKey.trim();
+    let targetKey = cleanKey;
+
+    if (!validCanonicalIds.has(cleanKey) && !CANONICAL_PREFIX_RE.test(cleanKey)) {
+      const numericPmid = normalizePmid(cleanKey) ?? normalizePmid(evaluation.pmid);
+      if (numericPmid) {
+        targetKey = pmidToId.get(numericPmid) ?? `pmid:${numericPmid}`;
+      }
+    }
+
+    remapped[targetKey] = {
+      ...evaluation,
+      recordId: targetKey
+    };
+  }
+
+  return remapped;
+}
+
 function normalizeSnapshotForStorage(snapshot: SavedReviewSnapshot): SavedReviewSnapshot {
   const cleanSettings = sanitizeSearchSettings(snapshot.searchSettings);
   const hydratedArticles = (snapshot.screenedArticles || []).map((art) =>
     hydrateLegacyScreenedArticle(art)
   );
+  const remappedRob = remapRobEvaluationsToCanonicalIds(
+    snapshot.robEvaluations || {},
+    hydratedArticles
+  );
   const summary = computeReviewSummary(
     snapshot.resultData,
     hydratedArticles,
-    snapshot.robEvaluations
+    remappedRob
   );
   const cleanSnapshot: SavedReviewSnapshot = {
     schemaVersion: 2,
@@ -290,7 +335,7 @@ function normalizeSnapshotForStorage(snapshot: SavedReviewSnapshot): SavedReview
     resultData: snapshot.resultData,
     refinementCount: Number.isFinite(snapshot.refinementCount) ? snapshot.refinementCount : 0,
     screenedArticles: hydratedArticles,
-    robEvaluations: { ...snapshot.robEvaluations },
+    robEvaluations: remappedRob,
     ...(snapshot.importBatches && snapshot.importBatches.length > 0
       ? { importBatches: [...snapshot.importBatches] }
       : {}),

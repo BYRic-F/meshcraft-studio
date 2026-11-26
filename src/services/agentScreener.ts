@@ -23,6 +23,7 @@ import {
   buildCanonicalRecordId,
   extractFirstAuthorSurname,
   extractPubYear,
+  getArticleKey,
   inferRecordKindFromPubTypes,
   normalizeDoi,
   normalizePmid,
@@ -80,8 +81,12 @@ function hasMissingOrEmptyAbstract(abstractText?: string): boolean {
 }
 
 export interface RawPubMedArticleInput {
+  readonly id?: string;
   readonly pmid?: string | number;
   readonly doi?: string | null;
+  readonly identifiers?: StudyIdentifiers;
+  readonly sources?: readonly BibliographicSource[];
+  readonly recordKind?: StudyRecordKind;
   readonly title?: string;
   readonly authors?: string;
   readonly source?: string;
@@ -89,6 +94,7 @@ export interface RawPubMedArticleInput {
   readonly abstract?: string;
   readonly meshHeadings?: readonly string[];
   readonly publicationTypes?: readonly string[];
+  readonly language?: string;
   readonly url?: string;
 }
 
@@ -198,22 +204,57 @@ export async function runAgentScreeningDeep(
   let failedPendingCount = 0;
   let lastErrorMessage: string | undefined;
 
-  const buildPendingArticle = (art: RawPubMedArticleInput): ScreenedArticle => {
-    const pmid = String(art.pmid || '');
+  const buildCanonicalBase = (art: RawPubMedArticleInput): ScreenedArticle => {
+    const rawPmid = art.pmid !== undefined ? String(art.pmid).trim() : '';
+    const normPmid = normalizePmid(art.identifiers?.pmid ?? rawPmid);
+    const normDoi = normalizeDoi(art.identifiers?.doi ?? art.doi);
+    const identifiers: StudyIdentifiers = {
+      ...(art.identifiers ?? {}),
+      ...(normPmid ? { pmid: normPmid } : {}),
+      ...(normDoi ? { doi: normDoi } : {})
+    };
+    const sources: readonly BibliographicSource[] =
+      art.sources && art.sources.length > 0 ? [...art.sources] : ['pubmed'];
+    const publicationTypes = Array.isArray(art.publicationTypes) ? [...art.publicationTypes] : [];
+    const recordKind: StudyRecordKind =
+      art.recordKind ?? inferRecordKindFromPubTypes(publicationTypes, sources[0]);
+    const title = art.title || '';
+    const authors = art.authors || '';
+    const pubDate = art.pubDate || '';
+    const id =
+      (typeof art.id === 'string' && art.id.trim().length > 0 ? art.id.trim() : undefined) ??
+      buildCanonicalRecordId(
+        identifiers,
+        normalizeTitleForDedup(title),
+        extractFirstAuthorSurname(authors),
+        extractPubYear(pubDate)
+      );
+    const url = resolvePreferredUrl(
+      identifiers,
+      art.url || (normPmid ? `https://pubmed.ncbi.nlm.nih.gov/${normPmid}/` : '')
+    );
+
     return {
-      pmid,
-      doi: art.doi || undefined,
-      title: art.title || '',
-      authors: art.authors || '',
+      id,
+      pmid: normPmid ?? rawPmid,
+      ...(normDoi ? { doi: normDoi } : {}),
+      identifiers,
+      sources,
+      recordKind,
+      title,
+      authors,
       source: art.source || '',
-      pubDate: art.pubDate || '',
+      pubDate,
       abstract: art.abstract || '',
       meshHeadings: Array.isArray(art.meshHeadings) ? [...art.meshHeadings] : [],
-      publicationTypes: Array.isArray(art.publicationTypes) ? [...art.publicationTypes] : [],
+      publicationTypes,
+      ...(art.language ? { language: art.language } : {}),
       status: 'pending',
-      url: art.url || `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`
+      url
     };
   };
+
+  const buildPendingArticle = (art: RawPubMedArticleInput): ScreenedArticle => buildCanonicalBase(art);
 
   const markItemsPending = (items: readonly IndexedArticle[], countAsFailure = false) => {
     for (const entry of items) {
@@ -249,12 +290,19 @@ export async function runAgentScreeningDeep(
     }
 
     const toPayload = (list: readonly IndexedArticle[]) =>
-      list.map(({ article }) => ({
-        pmid: String(article.pmid || ''),
-        title: article.title || '',
-        abstract: article.abstract || '',
-        meshHeadings: article.meshHeadings ? [...article.meshHeadings] : []
-      }));
+      list.map(({ article }) => {
+        const base = buildCanonicalBase(article);
+        return {
+          id: base.id,
+          pmid: base.pmid,
+          identifiers: base.identifiers,
+          sources: base.sources,
+          recordKind: base.recordKind,
+          title: base.title,
+          abstract: base.abstract,
+          meshHeadings: [...base.meshHeadings]
+        };
+      });
 
     let evaluatedBatch: BatchScreenItemResult[] = [];
     let lastErr: unknown = null;
@@ -298,34 +346,28 @@ export async function runAgentScreeningDeep(
 
     const evalMap = new Map<string, BatchScreenItemResult>();
     for (const e of evaluatedBatch) {
-      if (e.pmid) {
-        const rawKey = String(e.pmid).trim();
-        const digitsKey = rawKey.replace(/\D+/g, '');
-        evalMap.set(rawKey, e);
-        if (digitsKey) evalMap.set(digitsKey, e);
+      if (e.recordId && e.recordId.trim()) {
+        evalMap.set(e.recordId.trim(), e);
+      }
+      if (e.pmid && String(e.pmid).trim()) {
+        evalMap.set(String(e.pmid).trim(), e);
       }
     }
 
     const missingEntries: IndexedArticle[] = [];
     for (const entry of itemsWithAbstract) {
       const { slotIndex, article } = entry;
-      const pmid = String(article.pmid || '');
-      const aiRes = evalMap.get(pmid);
+      const base = buildCanonicalBase(article);
+      const artKey = getArticleKey(base);
+      const pmidTrimmed = String(base.pmid || '').trim();
+      const aiRes = evalMap.get(artKey) ?? (pmidTrimmed ? evalMap.get(pmidTrimmed) : undefined);
       if (!aiRes) {
         missingEntries.push(entry);
         continue;
       }
 
       const screened: ScreenedArticle = {
-        pmid,
-        doi: article.doi || undefined,
-        title: article.title || '',
-        authors: article.authors || '',
-        source: article.source || '',
-        pubDate: article.pubDate || '',
-        abstract: article.abstract || '',
-        meshHeadings: article.meshHeadings ? [...article.meshHeadings] : [],
-        publicationTypes: article.publicationTypes ? [...article.publicationTypes] : [],
+        ...base,
         status: aiRes.status,
         exclusionReason:
           aiRes.status === 'excluded'
@@ -338,7 +380,6 @@ export async function runAgentScreeningDeep(
             : aiRes.status === 'maybe'
               ? 'Information partielle au résumé : à vérifier sur texte intégral.'
               : PRISMA_EXCLUSION_LABELS_FR.other),
-        url: article.url || `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
         evaluatedBy
       };
       commitScreenedArticle(slotIndex, screened);
@@ -376,21 +417,12 @@ export async function runAgentScreeningDeep(
     for (const entry of batch) {
       const { slotIndex, article } = entry;
       if (hasMissingOrEmptyAbstract(article.abstract)) {
-        const pmid = String(article.pmid || '');
+        const base = buildCanonicalBase(article);
         commitScreenedArticle(slotIndex, {
-          pmid,
-          doi: article.doi || undefined,
-          title: article.title || '',
-          authors: article.authors || '',
-          source: article.source || '',
-          pubDate: article.pubDate || '',
-          abstract: article.abstract || '',
-          meshHeadings: article.meshHeadings ? [...article.meshHeadings] : [],
-          publicationTypes: article.publicationTypes ? [...article.publicationTypes] : [],
+          ...base,
           status: 'maybe',
           evidenceSnippet:
-            "Résumé absent dans PubMed : retenu par précaution pour vérification sur texte intégral (directive Cochrane / PRISMA 2020).",
-          url: article.url || `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
+            "Résumé absent dans la notice : retenu par précaution pour vérification sur texte intégral (directive Cochrane / PRISMA 2020).",
           evaluatedBy
         });
       } else {
@@ -456,7 +488,7 @@ export function computeScreeningMetrics(articles: ScreenedArticle[]): ScreeningR
   excluded.forEach(a => {
     const normalizedReason = (a.exclusionReason || '').trim() || "Autre critère de non-conformité";
     if (!reasonMap[normalizedReason]) reasonMap[normalizedReason] = [];
-    reasonMap[normalizedReason].push(a.pmid);
+    reasonMap[normalizedReason].push(getArticleKey(a));
   });
 
   const exclusionBreakdown = Object.entries(reasonMap)
@@ -494,15 +526,20 @@ export function selectPendingArticlesBatch(
 }
 
 /**
- * Fusionne de façon immuable le résultat d'un article dépouillé par PMID en préservant
- * toutes les autres décisions existantes (manuelles, Rayyan ou IA précédente).
+ * Fusionne de façon immuable le résultat d'un article dépouillé par clé canonique (`id` ou `pmid`)
+ * en préservant toutes les autres décisions existantes (manuelles, Rayyan ou IA précédente).
  */
 export function mergeScreenedArticleUpdate(
   articles: readonly ScreenedArticle[],
   updated: ScreenedArticle
 ): ScreenedArticle[] {
+  const updatedKey = getArticleKey(updated);
   return articles.map(art => {
-    if (art.pmid !== updated.pmid) return art;
+    const artKey = getArticleKey(art);
+    const sameRecord =
+      (Boolean(artKey) && artKey === updatedKey) ||
+      (Boolean(art.pmid) && Boolean(updated.pmid) && art.pmid === updated.pmid);
+    if (!sameRecord) return art;
     if (art.status !== 'pending' && (art.evaluatedBy === 'manual' || art.evaluatedBy === 'rayyan')) {
       return art;
     }

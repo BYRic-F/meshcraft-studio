@@ -18,6 +18,13 @@ import {
   normalizeAuditObservations,
   stripLeadingObservationEmojis
 } from './rustEngineService';
+import {
+  BibliographicSource,
+  StudyIdentifiers,
+  StudyRecordKind,
+  formatPrimaryIdentifierLabel,
+  getArticleKey
+} from './studyRecordTypes';
 
 export type AiProvider = 'gemini' | 'openai' | 'anthropic';
 export type AiRoutingMode = 'smart' | 'pro_only' | 'economy';
@@ -2147,6 +2154,7 @@ export function parseScreeningResponse(rawResponse: string): BatchScreenItemResu
 }
 
 export interface BatchScreenItemResult {
+  recordId?: string;
   pmid: string;
   status: 'included' | 'maybe' | 'excluded';
   exclusionCategory?: PrismaExclusionCategory;
@@ -2204,14 +2212,25 @@ export function clearAiScreeningCache(): void {
   screeningDecisionCache.clear();
 }
 
+export interface BatchScreeningArticleInput {
+  readonly id?: string;
+  readonly pmid: string;
+  readonly identifiers?: StudyIdentifiers;
+  readonly sources?: readonly BibliographicSource[];
+  readonly recordKind?: StudyRecordKind;
+  readonly title: string;
+  readonly abstract: string;
+  readonly meshHeadings?: string[];
+}
+
 /**
  * AGENT DE SCREENING PAR LOTS (Routé sur le tier 'batch' : Flash / GPT-4o-mini / Haiku) :
- * Évaluation clinique simultanée des articles PubMed avec cache d'idempotence.
- * Respecte le principe de précaution Cochrane : l'absence de résumé ou une incertitude au stade titre/résumé
- * classe la référence en 'maybe' (À vérifier sur texte intégral) plutôt qu'en exclusion abusive.
+ * Évaluation clinique simultanée des notices (PubMed, Embase, Cochrane, CENTRAL) avec cache d'idempotence.
+ * Utilise un index court de lot ("1".."N") côté prompt pour éviter toute erreur de recopie d'ID opaque (doi/fp)
+ * puis remappe de manière déterministe vers `getArticleKey(art)`.
  */
 export async function aiScreenBatchArticles(
-  articles: Array<{ pmid: string; title: string; abstract: string; meshHeadings?: string[] }>,
+  articles: Array<BatchScreeningArticleInput>,
   pico: { p: string; i: string; c: string; o: string; not?: string },
   abortSignal?: AbortSignal
 ): Promise<BatchScreenItemResult[]> {
@@ -2222,10 +2241,10 @@ export async function aiScreenBatchArticles(
 
   const picoFp = computePicoFingerprint(pico);
   const cachedResults: BatchScreenItemResult[] = [];
-  const uncachedArticles: Array<{ pmid: string; title: string; abstract: string; meshHeadings?: string[] }> = [];
+  const uncachedArticles: BatchScreeningArticleInput[] = [];
 
   for (const art of articles) {
-    const key = `${String(art.pmid).trim()}::${picoFp}`;
+    const key = `${getArticleKey(art)}::${picoFp}`;
     const hit = screeningDecisionCache.get(key);
     if (hit) {
       cachedResults.push(hit);
@@ -2239,7 +2258,7 @@ export async function aiScreenBatchArticles(
   }
 
   const prompt = `Tu es un médecin méthodologiste senior expert en revues systématiques (directives PRISMA 2020 et Cochrane Handbook).
-Évalue l'éligibilité clinique de cette série de ${uncachedArticles.length} articles PubMed pour notre revue systématique.
+Évalue l'éligibilité clinique de cette série de ${uncachedArticles.length} notices bibliographiques pour notre revue systématique.
 
 CRITÈRES D'ÉLIGIBILITÉ (PICO/PECO) :
 - Population cible (P) : "${pico.p}"
@@ -2249,7 +2268,7 @@ CRITÈRES D'ÉLIGIBILITÉ (PICO/PECO) :
 - Critères d'exclusion formels (NOT) : "${pico.not || 'Aucun'}"
 
 DIRECTIVES MÉDICALES D'ÉVALUATION (3 STATUTS : included, maybe, excluded) :
-1. "excluded" : Uniquement si une cause d'inéligibilité formelle est établie avec certitude dès le titre/résumé (modèle exclusivement animal/in vitro, hors sujet manifeste, critère NOT présent, éditorial sans données originales).
+1. "excluded" : Uniquement si une cause d'inéligibilité formelle est établie avec certitude dès le titre/résumé (modèle exclusivement animal/in vitro, hors sujet manifeste, critère NOT présent, éditorial ou protocole sans données originales).
 2. "maybe" (À vérifier sur texte intégral) : Principe de précaution Cochrane — si le résumé est absent ou si l'information au stade titre/résumé est insuffisante pour trancher avec certitude sur un sous-groupe ou un critère.
 3. "included" : Si la population, l'intervention/exposition et le critère concordent clairement avec le PICO.
 4. Résume de manière ultra-concise en français (max 10-12 mots) la preuve clinique dans "evidenceSnippet".
@@ -2258,28 +2277,32 @@ DIRECTIVES MÉDICALES D'ÉVALUATION (3 STATUTS : included, maybe, excluded) :
    - "intervention" (intervention / exposition non conforme)
    - "comparator" (comparateur non conforme)
    - "outcome" (critère de jugement absent ou hors périmètre)
-   - "study_design" (revue narrative, éditorial, lettre, protocole sans résultats, cas clinique isolé)
+   - "study_design" (revue narrative, éditorial, lettre, protocole/registre sans résultats, cas clinique isolé)
    - "preclinical" (modèle animal, in vitro ou cellulaire)
    - "other" (autre motif d'exclusion)
 
-ARTICLES PUBMED À ÉVALUER :
-${uncachedArticles.map((a, idx) => `
---- NOTICE [${idx + 1}/${uncachedArticles.length}] ---
-PMID: ${a.pmid}
+NOTICES À ÉVALUER (recopie exactement l'index court ID_LOT "1".."${uncachedArticles.length}" dans le champ "pmid" du JSON) :
+${uncachedArticles.map((a, idx) => {
+  const kindTag =
+    a.recordKind === 'trial_registry' ? '\nType: Registre d\'essai (protocole sans résultats)' : '';
+  return `
+--- NOTICE [ID_LOT: "${idx + 1}" | ${idx + 1}/${uncachedArticles.length}] ---
+Référence: ${formatPrimaryIdentifierLabel(a)}${kindTag}
 Titre: ${a.title}
 Résumé: ${compressAbstractForLlm(a.abstract, 850)}
-MeSH: ${(a.meshHeadings || []).slice(0, 8).join(', ') || "Non indexé"}
-`).join('\n')}
+Mots-clés / MeSH: ${(a.meshHeadings || []).slice(0, 8).join(', ') || 'Non indexé'}
+`;
+}).join('\n')}
 
-Réponds STRICTEMENT par un tableau JSON valide contenant exactement un objet pour chaque PMID évalué :
+Réponds STRICTEMENT par un tableau JSON valide contenant exactement un objet par notice (avec l'index court ID_LOT dans "pmid") :
 [
   {
-    "pmid": "${uncachedArticles[0]?.pmid || '12345'}",
+    "pmid": "1",
     "status": "included",
     "evidenceSnippet": "ECR évaluant la population cible avec résultats concordants."
   },
   {
-    "pmid": "99999999",
+    "pmid": "2",
     "status": "excluded",
     "exclusionCategory": "preclinical",
     "evidenceSnippet": "Étude exclusivement animale sur modèle murin."
@@ -2301,10 +2324,42 @@ Réponds STRICTEMENT par un tableau JSON valide contenant exactement un objet po
 
   const validFresh = parseScreeningResponse(rawResponse);
   if (validFresh.length > 0) {
+    const mappedResults: BatchScreenItemResult[] = [];
+    const matchedKeys = new Set<string>();
+
     for (const cleanItem of validFresh) {
-      screeningDecisionCache.set(`${cleanItem.pmid}::${picoFp}`, cleanItem);
+      const rawKey = String(cleanItem.pmid || '').trim();
+      let matchedArticle = uncachedArticles.find(
+        (a) =>
+          getArticleKey(a) === rawKey ||
+          (Boolean(a.id) && a.id === rawKey) ||
+          (Boolean(a.pmid) && a.pmid.trim() === rawKey)
+      );
+
+      if (!matchedArticle && /^\d{1,3}$/.test(rawKey)) {
+        const batchIdx = Number.parseInt(rawKey, 10) - 1;
+        if (batchIdx >= 0 && batchIdx < uncachedArticles.length) {
+          matchedArticle = uncachedArticles[batchIdx];
+        }
+      }
+
+      if (!matchedArticle) continue;
+      const canonicalKey = getArticleKey(matchedArticle);
+      if (matchedKeys.has(canonicalKey)) continue;
+      matchedKeys.add(canonicalKey);
+
+      const finalItem: BatchScreenItemResult = {
+        ...cleanItem,
+        recordId: canonicalKey,
+        pmid: matchedArticle.pmid?.trim() || canonicalKey
+      };
+      screeningDecisionCache.set(`${canonicalKey}::${picoFp}`, finalItem);
+      mappedResults.push(finalItem);
     }
-    return [...cachedResults, ...validFresh];
+
+    if (mappedResults.length > 0) {
+      return [...cachedResults, ...mappedResults];
+    }
   }
 
   throw new ScreeningJsonParseError("La réponse du modèle IA n'a pas pu être interprétée comme un JSON de dépouillement valide.");
@@ -2806,6 +2861,7 @@ Réponds STRICTEMENT au format JSON avec cette structure :
 export type StudyDesignType = 'rct' | 'observational' | 'review' | 'other';
 
 export interface Rob2ArticleEvaluation {
+  recordId?: string;
   pmid: string;
   d1: 'low' | 'moderate' | 'high'; // Biais lié à la randomisation / confusion
   d2: 'low' | 'moderate' | 'high'; // Déviations d'intervention (insu)
@@ -2820,20 +2876,26 @@ export interface Rob2ArticleEvaluation {
 
 /**
  * Infère le schéma d'étude (ECR, étude observationnelle, revue systématique ou autre)
- * en donnant la priorité aux types de publication officiels NLM (`<PublicationType>`),
- * puis en repliant sur l'analyse lexicale du titre et du résumé.
- * Le repli par défaut est `'other'` (jamais `'rct'`) afin de ne pas classer par erreur
- * une revue narrative ou une recommandation en essai contrôlé randomisé.
+ * en donnant la priorité au `recordKind` (un `trial_registry` sans résultats est toujours `'other'`),
+ * aux types de publication officiels, puis à l'analyse lexicale du titre et du résumé.
  */
 export function inferStudyDesignFromText(
   title: string,
   abstract: string = '',
-  publicationTypes?: readonly string[]
+  publicationTypes?: readonly string[],
+  recordKind?: StudyRecordKind
 ): StudyDesignType {
+  if (recordKind === 'trial_registry') {
+    return 'other';
+  }
   if (publicationTypes && publicationTypes.length > 0) {
     const normalizedTypes = new Set(
       publicationTypes.map(pt => pt.trim().toLowerCase()).filter(Boolean)
     );
+
+    if (normalizedTypes.has('trial registry record')) {
+      return 'other';
+    }
 
     // 1. Revues systématiques & méta-analyses (prioritaires devant "Review" générique)
     if (
@@ -2911,19 +2973,33 @@ export function computeCochraneOverallRating(
 
 /**
  * Sélectionne strictement les études éligibles non encore évaluées pour le pré-repérage des biais :
- * - exclut toute étude déjà évaluée (manuelle ou IA) afin de ne jamais écraser un travail existant,
- * - exclut les formats de type `'other'` (revues narratives, recommandations, éditoriaux, cas cliniques).
+ * - exclut toute étude déjà évaluée (par clé canonique `id` ou par `pmid` hérité) ;
+ * - exclut les formats de type `'other'` (revues narratives, recommandations, éditoriaux, cas cliniques, registres d'essais).
  */
 export function selectUnassessedRobBatch<
-  T extends { readonly pmid: string; readonly title: string; readonly abstract: string; readonly publicationTypes?: readonly string[] }
+  T extends {
+    readonly id?: string;
+    readonly pmid: string;
+    readonly identifiers?: StudyIdentifiers;
+    readonly recordKind?: StudyRecordKind;
+    readonly title: string;
+    readonly abstract: string;
+    readonly publicationTypes?: readonly string[];
+  }
 >(
   articles: readonly T[],
   existingEvaluations: Readonly<Record<string, Rob2ArticleEvaluation>>,
   limit?: number
 ): T[] {
   const eligible = (articles || []).filter(art => {
-    if (existingEvaluations[art.pmid]) return false;
-    const design = inferStudyDesignFromText(art.title, art.abstract, art.publicationTypes);
+    const key = getArticleKey(art);
+    if (existingEvaluations[key] || (art.pmid && existingEvaluations[art.pmid])) return false;
+    const design = inferStudyDesignFromText(
+      art.title,
+      art.abstract,
+      art.publicationTypes,
+      art.recordKind
+    );
     return design !== 'other';
   });
   if (typeof limit === 'number' && limit > 0) {
@@ -2934,12 +3010,19 @@ export function selectUnassessedRobBatch<
 
 /**
  * Pré-évaluation par lots (Batch) du risque de biais Cochrane RoB 2 / ROBINS-I.
- * Permet d'évaluer jusqu'à 20 études incluses en 1 seul appel API (évite les erreurs HTTP 429).
- * Prend en charge l'interruption immédiate via `abortSignal`.
- * Règle stricte sur résumé : tout élément non documenté dans l'abstract = "moderate".
+ * Permet d'évaluer jusqu'à 20 études incluses en 1 seul appel API via un index court de lot ("1".."N")
+ * remappé de façon déterministe vers `getArticleKey(art)` (sans aucune perte sur les IDs opaques).
  */
 export async function aiEvaluateBatchRoB2(
-  articles: ReadonlyArray<{ pmid: string; title: string; abstract: string; publicationTypes?: readonly string[] }>,
+  articles: ReadonlyArray<{
+    readonly id?: string;
+    readonly pmid: string;
+    readonly identifiers?: StudyIdentifiers;
+    readonly recordKind?: StudyRecordKind;
+    readonly title: string;
+    readonly abstract: string;
+    readonly publicationTypes?: readonly string[];
+  }>,
   abortSignal?: AbortSignal
 ): Promise<Map<string, Rob2ArticleEvaluation>> {
   if (abortSignal?.aborted) {
@@ -2955,9 +3038,9 @@ export async function aiEvaluateBatchRoB2(
   const articlesPayload = articles.map((art, idx) => {
     const abs = compressAbstractForLlm(art.abstract || '', 1200);
     const pubTypesLine = art.publicationTypes && art.publicationTypes.length > 0
-      ? `\nTypes de publication NLM : ${art.publicationTypes.join(', ')}`
+      ? `\nTypes de publication : ${art.publicationTypes.join(', ')}`
       : '';
-    return `[ÉTUDE #${idx + 1} | PMID: "${art.pmid}"]
+    return `[ÉTUDE #${idx + 1} | ID_LOT: "${idx + 1}" | Référence : ${formatPrimaryIdentifierLabel(art)}]
 Titre : ${art.title}${pubTypesLine}
 Résumé : ${abs}`;
   }).join('\n\n---\n\n');
@@ -2965,11 +3048,11 @@ Résumé : ${abs}`;
   const prompt = `Tu es un médecin méthodologiste expert de la collaboration Cochrane (outils RoB 2 pour les essais randomisés, ROBINS-I pour les études observationnelles, AMSTAR 2 pour les revues).
 Analyse le lot de ${articles.length} étude(s) ci-dessous à partir de leur titre et résumé pour pré-évaluer le risque de biais.
 
-LOT D'ÉTUDES À ÉVALUER :
+LOT D'ÉTUDES À ÉVALUER (recopie exactement l'index court ID_LOT "1".."${articles.length}" dans le champ "pmid") :
 ${articlesPayload}
 
 RÈGLES MÉTHODOLOGIQUES STRICTES (PRUDENCE SUR RÉSUMÉ) :
-1. INTERDICTION D'INVENTER UN FAIBLE RISQUE ("low") SANS PREUVE TEXTUELLE : Un résumé PubMed est court. Si un domaine n'est PAS explicitement documenté dans le résumé, tu DOIS impérativement le coter "moderate" ("Préoccupations / À vérifier sur texte intégral") et JAMAIS "low".
+1. INTERDICTION D'INVENTER UN FAIBLE RISQUE ("low") SANS PREUVE TEXTUELLE : Un résumé est court. Si un domaine n'est PAS explicitement documenté dans le résumé, tu DOIS impérativement le coter "moderate" ("Préoccupations / À vérifier sur texte intégral") et JAMAIS "low".
 2. Critères de cotation par domaine :
    - D1 (Randomisation / Confusion) : "low" uniquement si randomisation explicite (et séquence/dissimulation mentionnée) ; "moderate" si randomisé sans détail d'assignation ; "high" si non randomisé ou biais de sélection manifeste.
    - D2 (Déviations / Insu des participants et cliniciens) : "low" si double-insu / double-blind explicite ; "moderate" si essai ouvert (ex: nutrition, chirurgie, mode de vie) sans déviation majeure signalée ou insu non précisé ; "high" si étude ouverte avec contamination/non-adhérence majeure.
@@ -2979,10 +3062,10 @@ RÈGLES MÉTHODOLOGIQUES STRICTES (PRUDENCE SUR RÉSUMÉ) :
 3. Identifie également "studyDesign" : "rct" (essai contrôlé randomisé), "observational" (cohorte, cas-témoins, rétrospectif), "review" (revue systématique / méta-analyse) ou "other" (revue narrative, recommandation/guideline, consensus, cas clinique, éditorial, autre).
 4. Rédige dans "justification" 1 phrase concise en français citant les éléments factuels du résumé (ex: "Essai ouvert sans mention d'ITT ni d'enregistrement NCT dans le résumé, mais critère pondéral objectif").
 
-Réponds STRICTEMENT au format JSON sous forme d'un tableau d'objets :
+Réponds STRICTEMENT au format JSON sous forme d'un tableau d'objets (avec l'index court ID_LOT "1".."${articles.length}" dans "pmid") :
 [
   {
-    "pmid": "identifiant PMID numérique exact (ex: 42429418)",
+    "pmid": "1",
     "studyDesign": "rct" ou "observational" ou "review" ou "other",
     "d1": "low" ou "moderate" ou "high",
     "d2": "low" ou "moderate" ou "high",
@@ -3028,18 +3111,37 @@ Réponds STRICTEMENT au format JSON sous forme d'un tableau d'objets :
 
   for (let idx = 0; idx < items.length; idx++) {
     const item = items[idx];
-    const rawPmid = String(item?.pmid || '').replace(/\D+/g, '').trim();
-    const matchedArticle =
-      articles.find(a => String(a.pmid).trim() === rawPmid) ||
-      (items.length === articles.length ? articles[idx] : undefined) ||
-      (articles.length === 1 ? articles[0] : undefined);
+    const rawKey = String(item?.pmid ?? item?.recordId ?? '').trim();
+
+    let matchedArticle = articles.find(
+      (a) =>
+        getArticleKey(a) === rawKey ||
+        (Boolean(a.id) && a.id === rawKey) ||
+        (Boolean(a.pmid) && a.pmid.trim() === rawKey)
+    );
+
+    if (!matchedArticle && /^\d{1,3}$/.test(rawKey)) {
+      const batchIdx = Number.parseInt(rawKey, 10) - 1;
+      if (batchIdx >= 0 && batchIdx < articles.length) {
+        matchedArticle = articles[batchIdx];
+      }
+    }
+
+    if (!matchedArticle) {
+      matchedArticle =
+        (items.length === articles.length ? articles[idx] : undefined) ||
+        (articles.length === 1 ? articles[0] : undefined);
+    }
 
     if (!matchedArticle) continue;
-    const pmid = String(matchedArticle.pmid).trim();
+    const recordKey = getArticleKey(matchedArticle);
+    const mapKey = matchedArticle.id?.trim() || matchedArticle.pmid?.trim() || recordKey;
+    const pmid = matchedArticle.pmid?.trim() || mapKey;
     const fallbackDesign = inferStudyDesignFromText(
       matchedArticle.title || '',
       matchedArticle.abstract || '',
-      matchedArticle.publicationTypes
+      matchedArticle.publicationTypes,
+      matchedArticle.recordKind
     );
 
     const d1 = safeRating(item.d1);
@@ -3049,7 +3151,8 @@ Réponds STRICTEMENT au format JSON sous forme d'un tableau d'objets :
     const d5 = safeRating(item.d5);
     const overall = computeCochraneOverallRating(d1, d2, d3, d4, d5);
 
-    resultMap.set(pmid, {
+    resultMap.set(mapKey, {
+      recordId: recordKey,
       pmid,
       d1,
       d2,

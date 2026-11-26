@@ -7,9 +7,17 @@
 
 import { ScreenedArticle } from './agentScreener';
 import { Rob2ArticleEvaluation, inferStudyDesignFromText, StudyDesignType } from './localAiService';
+import {
+  formatPrimaryIdentifierLabel,
+  getArticleKey,
+  normalizeDoi,
+  normalizePmid,
+  normalizeTitleForDedup
+} from './studyRecordTypes';
 
 export interface RayyanImportedDecision {
-  readonly key: string; // PMID ou titre normalisé
+  readonly key: string; // Clé canonique, PMID, DOI ou titre normalisé
+  readonly aliases?: readonly string[];
   readonly status: 'included' | 'maybe' | 'excluded';
   readonly exclusionReason?: string;
   readonly evaluatedBy: 'rayyan';
@@ -23,6 +31,9 @@ export interface BenchmarkCoverageResult {
 }
 
 export interface ReadingMatrixRow {
+  readonly recordId: string;
+  readonly identifierLabel: string;
+  readonly sourcesLabel: string;
   readonly pmid: string;
   readonly url: string;
   readonly firstAuthorYear: string;
@@ -73,9 +84,17 @@ export function exportToRayyanRis(articles: readonly ScreenedArticle[], includeA
 
   for (const art of articles) {
     const lines: string[] = [];
+    const articleKey = getArticleKey(art);
+    const accession =
+      normalizePmid(art.identifiers?.pmid ?? art.pmid) ||
+      art.identifiers?.cochraneId ||
+      art.identifiers?.embasePui ||
+      art.identifiers?.embaseId ||
+      articleKey;
+
     lines.push('TY  - JOUR');
-    lines.push(`AN  - ${art.pmid}`);
-    lines.push(`ID  - ${art.pmid}`);
+    if (accession) lines.push(`AN  - ${accession}`);
+    if (articleKey) lines.push(`ID  - ${articleKey}`);
     if (art.title) lines.push(`TI  - ${art.title}`);
 
     const authorsList = (art.authors || '')
@@ -93,7 +112,8 @@ export function exportToRayyanRis(articles: readonly ScreenedArticle[], includeA
     if (art.source) lines.push(`JO  - ${art.source}`);
     const year = extractYearFromPubDate(art.pubDate);
     if (year) lines.push(`PY  - ${year}`);
-    if (art.doi) lines.push(`DO  - ${art.doi}`);
+    const doi = normalizeDoi(art.identifiers?.doi ?? art.doi);
+    if (doi) lines.push(`DO  - ${doi}`);
     if (art.abstract) lines.push(`AB  - ${art.abstract.replace(/\r?\n/g, ' ')}`);
     if (art.url) lines.push(`UR  - ${art.url}`);
 
@@ -123,14 +143,17 @@ export function exportToRayyanCsv(articles: readonly ScreenedArticle[], includeA
   for (const art of articles) {
     const year = extractYearFromPubDate(art.pubDate);
     const notes = formatRayyanAiNote(art, includeAiNotes);
+    const articleKey = getArticleKey(art);
+    const realPmid = normalizePmid(art.identifiers?.pmid ?? art.pmid) || '';
+    const realDoi = normalizeDoi(art.identifiers?.doi ?? art.doi) || '';
     const row = [
-      escapeCsvCell(art.pmid),
+      escapeCsvCell(articleKey),
       escapeCsvCell(art.title),
       escapeCsvCell(art.authors),
       escapeCsvCell(art.source),
       escapeCsvCell(year),
-      escapeCsvCell(art.pmid),
-      escapeCsvCell(art.doi || ''),
+      escapeCsvCell(realPmid),
+      escapeCsvCell(realDoi),
       escapeCsvCell(art.url),
       escapeCsvCell(art.abstract),
       escapeCsvCell(notes)
@@ -187,66 +210,164 @@ function parseRayyanNoteField(noteText: string): { status: 'included' | 'maybe' 
   return null;
 }
 
+function parseCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === ',' && !inQuotes) {
+      cells.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function registerRayyanDecisionAliases(
+  decisions: Map<string, RayyanImportedDecision>,
+  aliases: readonly string[],
+  parsed: { status: 'included' | 'maybe' | 'excluded'; exclusionReason?: string }
+): void {
+  const nonEmptyAliases = Array.from(new Set(aliases.map((a) => a.trim()).filter(Boolean)));
+  if (nonEmptyAliases.length === 0) return;
+  const primaryKey = nonEmptyAliases[0];
+  decisions.set(primaryKey, {
+    key: primaryKey,
+    aliases: nonEmptyAliases,
+    status: parsed.status,
+    exclusionReason: parsed.exclusionReason,
+    evaluatedBy: 'rayyan'
+  });
+}
+
 /**
- * Importe un fichier d'export Rayyan (.ris ou .csv) et extrait les décisions humaines par PMID.
+ * Importe un fichier d'export Rayyan (.ris ou .csv) et extrait les décisions humaines multi-bases
+ * (clé canonique `ID`/`key`, `PMID`, `DOI` ou titre normalisé).
  */
 export function parseRayyanImport(rawContent: string): Map<string, RayyanImportedDecision> {
   const decisions = new Map<string, RayyanImportedDecision>();
   if (!rawContent || !rawContent.trim()) return decisions;
 
-  const trimmed = rawContent.trim();
+  const trimmed = rawContent.replace(/^\uFEFF/, '').trim();
 
   // Cas 1 : Format RIS (TY  - ... ER  -)
   if (/^TY\s+-/m.test(trimmed)) {
     const blocks = trimmed.split(/\bER\s+-[^\r\n]*/);
     for (const block of blocks) {
-      const anMatch = block.match(/^(?:AN|ID)\s+-\s*(\d+)/m) || block.match(/pubmed\.ncbi\.nlm\.nih\.gov\/(\d+)/i);
       const n1Matches = Array.from(block.matchAll(/^N1\s+-\s*(.+)$/gm)).map(m => m[1]).join(' | ');
-      if (anMatch && n1Matches) {
-        const pmid = anMatch[1].trim();
-        const parsed = parseRayyanNoteField(n1Matches);
-        if (parsed) {
-          decisions.set(pmid, {
-            key: pmid,
-            status: parsed.status,
-            exclusionReason: parsed.exclusionReason,
-            evaluatedBy: 'rayyan'
-          });
-        }
+      if (!n1Matches) continue;
+      const parsed = parseRayyanNoteField(n1Matches);
+      if (!parsed) continue;
+
+      const idMatch = block.match(/^ID\s+-\s*(.+)$/m);
+      const anMatch = block.match(/^AN\s+-\s*(.+)$/m);
+      const urlPmidMatch = block.match(/pubmed\.ncbi\.nlm\.nih\.gov\/(\d+)/i);
+      const doMatch = block.match(/^DO\s+-\s*(.+)$/m);
+      const titleMatch = block.match(/^(?:TI|T1)\s+-\s*(.+)$/m);
+
+      const aliases: string[] = [];
+      if (idMatch?.[1]?.trim()) aliases.push(idMatch[1].trim());
+      if (anMatch?.[1]?.trim()) {
+        const rawAn = anMatch[1].trim();
+        aliases.push(rawAn);
+        const normPmid = normalizePmid(rawAn);
+        if (normPmid) aliases.push(`pmid:${normPmid}`);
       }
+      if (urlPmidMatch?.[1]) {
+        aliases.push(urlPmidMatch[1]);
+        aliases.push(`pmid:${urlPmidMatch[1]}`);
+      }
+      const normDoi = normalizeDoi(doMatch?.[1]);
+      if (normDoi) aliases.push(`doi:${normDoi}`);
+      const normTitle = titleMatch?.[1] ? normalizeTitleForDedup(titleMatch[1]) : '';
+      if (normTitle) aliases.push(`title:${normTitle}`);
+
+      registerRayyanDecisionAliases(decisions, aliases, parsed);
     }
     return decisions;
   }
 
-  // Cas 2 : Format CSV Rayyan
+  // Cas 2 : Format CSV Rayyan (avec en-tête ou repli regex PMID)
   const lines = trimmed.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length < 2) return decisions;
+
+  const headerCells = parseCsvLine(lines[0]).map((h) => h.toLowerCase());
+  const keyCol = headerCells.indexOf('key');
+  const titleCol = headerCells.indexOf('title');
+  const pmidCol = headerCells.indexOf('pmid');
+  const doiCol = headerCells.indexOf('doi');
+  const notesCol = headerCells.indexOf('notes');
+
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
-    const pmidMatch = line.match(/\b(\d{7,9})\b/);
-    const parsed = parseRayyanNoteField(line);
-    if (pmidMatch && parsed) {
-      const pmid = pmidMatch[1];
-      decisions.set(pmid, {
-        key: pmid,
-        status: parsed.status,
-        exclusionReason: parsed.exclusionReason,
-        evaluatedBy: 'rayyan'
-      });
+    const cells = parseCsvLine(line);
+    const noteText = notesCol >= 0 && cells[notesCol] ? cells[notesCol] : line;
+    const parsed = parseRayyanNoteField(noteText);
+    if (!parsed) continue;
+
+    const aliases: string[] = [];
+    if (keyCol >= 0 && cells[keyCol]) aliases.push(cells[keyCol]);
+    const pmidVal =
+      (pmidCol >= 0 ? normalizePmid(cells[pmidCol]) : undefined) ??
+      normalizePmid(line.match(/\b(\d{7,9})\b/)?.[1]);
+    if (pmidVal) {
+      aliases.push(pmidVal);
+      aliases.push(`pmid:${pmidVal}`);
     }
+    const doiVal = doiCol >= 0 ? normalizeDoi(cells[doiCol]) : undefined;
+    if (doiVal) aliases.push(`doi:${doiVal}`);
+    const titleVal = titleCol >= 0 && cells[titleCol] ? normalizeTitleForDedup(cells[titleCol]) : '';
+    if (titleVal) aliases.push(`title:${titleVal}`);
+
+    registerRayyanDecisionAliases(decisions, aliases, parsed);
   }
 
   return decisions;
 }
 
 /**
- * Applique les décisions importées depuis Rayyan à la cohorte d'articles locale.
+ * Applique les décisions importées depuis Rayyan à la cohorte d'articles locale (PubMed + Embase + Cochrane).
  */
 export function applyRayyanDecisions(
   articles: readonly ScreenedArticle[],
   decisions: Map<string, RayyanImportedDecision>
 ): ScreenedArticle[] {
+  const lookup = new Map<string, RayyanImportedDecision>();
+  for (const [k, dec] of decisions.entries()) {
+    lookup.set(k, dec);
+    for (const alias of dec.aliases ?? []) {
+      if (!lookup.has(alias)) {
+        lookup.set(alias, dec);
+      }
+    }
+  }
+
   return articles.map(art => {
-    const dec = decisions.get(String(art.pmid));
+    const key = getArticleKey(art);
+    const pmid = normalizePmid(art.identifiers?.pmid ?? art.pmid);
+    const doi = normalizeDoi(art.identifiers?.doi ?? art.doi);
+    const normTitle = normalizeTitleForDedup(art.title);
+
+    const dec =
+      (key ? lookup.get(key) : undefined) ??
+      (pmid ? lookup.get(pmid) ?? lookup.get(`pmid:${pmid}`) : undefined) ??
+      (art.identifiers?.cochraneId ? lookup.get(art.identifiers.cochraneId) : undefined) ??
+      (art.identifiers?.embasePui ? lookup.get(art.identifiers.embasePui) : undefined) ??
+      (doi ? lookup.get(`doi:${doi}`) : undefined) ??
+      (normTitle ? lookup.get(`title:${normTitle}`) : undefined);
+
     if (!dec) return art;
     return {
       ...art,
@@ -334,6 +455,19 @@ function buildPerStudyAbstractSummary(art: ScreenedArticle): string {
   return 'À compléter sur texte intégral.';
 }
 
+function formatSourcesDisplayLabel(art: ScreenedArticle): string {
+  const srcs = art.sources && art.sources.length > 0 ? art.sources : ['pubmed'];
+  return srcs
+    .map((s) => {
+      if (s === 'pubmed') return 'PubMed';
+      if (s === 'embase') return 'Embase';
+      if (s === 'cochrane_reviews') return 'Cochrane Reviews';
+      if (s === 'cochrane_central') return 'CENTRAL';
+      return 'RIS';
+    })
+    .join(', ');
+}
+
 /**
  * Construit les lignes de la Matrice de Synthèse (Tableau des études retenues)
  * sans répétition du PICO global statique : chaque colonne porte une information propre à l'étude.
@@ -349,10 +483,14 @@ export function buildReadingMatrixRows(
   );
 
   return eligible.map(art => {
-    const rob = robEvaluations[art.pmid];
+    const recordId = getArticleKey(art);
+    const rob = robEvaluations[recordId] ?? (art.pmid ? robEvaluations[art.pmid] : undefined);
     const studyDesign: StudyDesignType =
-      rob?.studyDesign || inferStudyDesignFromText(art.title, art.abstract, art.publicationTypes);
-    const firstAuthor = (art.authors || 'Auteur inconnu').split(',')[0].trim();
+      art.recordKind === 'trial_registry'
+        ? 'other'
+        : rob?.studyDesign ||
+          inferStudyDesignFromText(art.title, art.abstract, art.publicationTypes, art.recordKind);
+    const firstAuthor = (art.authors || (art.recordKind === 'trial_registry' ? 'Registre d\'essai' : 'Auteur inconnu')).split(',')[0].trim();
     const year = extractYearFromPubDate(art.pubDate);
     const screeningStatus: 'included' | 'maybe' = art.status === 'maybe' ? 'maybe' : 'included';
     const abstractSummary = buildPerStudyAbstractSummary(art);
@@ -363,16 +501,24 @@ export function buildReadingMatrixRows(
           ? rob.overall
           : 'unassessed';
     const notes =
-      rob?.justification ||
-      (studyDesign === 'other'
-        ? 'Format hors grille d\'évaluation des biais (revue narrative, recommandation ou autre)'
-        : screeningStatus === 'maybe'
-          ? 'À confirmer après lecture du texte intégral'
-          : 'Étude incluse après tri titre/résumé');
+      art.recordKind === 'trial_registry'
+        ? 'Registre d\'essai clinique sans résultats publiés (hors grille RoB)'
+        : rob?.justification ||
+          (studyDesign === 'other'
+            ? 'Format hors grille d\'évaluation des biais (revue narrative, recommandation ou autre)'
+            : screeningStatus === 'maybe'
+              ? 'À confirmer après lecture du texte intégral'
+              : 'Étude incluse après tri titre/résumé');
+
+    const identifierLabel = formatPrimaryIdentifierLabel(art);
+    const normPmid = normalizePmid(art.identifiers?.pmid ?? art.pmid) || art.pmid || '';
 
     return {
-      pmid: art.pmid,
-      url: art.url || `https://pubmed.ncbi.nlm.nih.gov/${art.pmid}/`,
+      recordId,
+      identifierLabel,
+      sourcesLabel: formatSourcesDisplayLabel(art),
+      pmid: normPmid,
+      url: art.url || (normPmid ? `https://pubmed.ncbi.nlm.nih.gov/${normPmid}/` : ''),
       firstAuthorYear: `${firstAuthor} (${year})`,
       journal: art.source || 'N/A',
       title: art.title,
@@ -391,7 +537,8 @@ export function buildReadingMatrixRows(
  */
 export function exportReadingMatrixCsv(rows: readonly ReadingMatrixRow[]): string {
   const headers = [
-    'PMID',
+    'Référence',
+    'Sources',
     'Auteur (Année)',
     'Revue',
     'Titre',
@@ -403,7 +550,8 @@ export function exportReadingMatrixCsv(rows: readonly ReadingMatrixRow[]): strin
   ].map(escapeCsvCell).join(',');
 
   const lines = rows.map(r => [
-    escapeCsvCell(r.pmid),
+    escapeCsvCell(r.identifierLabel),
+    escapeCsvCell(r.sourcesLabel),
     escapeCsvCell(r.firstAuthorYear),
     escapeCsvCell(r.journal),
     escapeCsvCell(r.title),
@@ -424,12 +572,12 @@ export function exportReadingMatrixMarkdown(rows: readonly ReadingMatrixRow[]): 
   if (rows.length === 0) {
     return '_Aucune étude retenue dans la matrice de synthèse._';
   }
-  const header = '| PMID | Auteur (Année) | Plan d\'étude & Statut | Synthèse titre/résumé | Risque de biais |\n| :--- | :--- | :--- | :--- | :--- |';
+  const header = '| Référence | Auteur (Année) | Plan d\'étude & Statut | Synthèse titre/résumé | Risque de biais |\n| :--- | :--- | :--- | :--- | :--- |';
   const body = rows.map(r => {
     const cleanSummary = r.abstractSummary.replace(/\|/g, '/').replace(/\r?\n/g, ' ');
     const statusLabel = r.screeningStatus === 'included' ? 'Incluse' : 'À vérifier';
     const robLabel = formatRobFrenchLabel(r.riskOfBiasOverall);
-    return `| ${r.pmid} | **${r.firstAuthorYear}** (_${r.journal}_) | ${r.studyDesignLabel} · ${statusLabel} | ${cleanSummary} | ${robLabel} |`;
+    return `| ${r.identifierLabel} | **${r.firstAuthorYear}** (_${r.journal}_) | ${r.studyDesignLabel} · ${statusLabel} | ${cleanSummary} | ${robLabel} |`;
   }).join('\n');
 
   return `${header}\n${body}\n`;

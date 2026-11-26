@@ -442,3 +442,38 @@ export function deduplicateAndMergeCorpus(
     addedRecordsCount
   };
 }
+
+/**
+ * Met à jour la liste des lots importés de manière idempotente :
+ * - un rechargement PubMed remplace le lot PubMed précédent sans jamais le doubler ;
+ * - un fichier RIS déjà importé (même `contentHash` non vide ou même `batchId`) est ignoré côté compteurs.
+ */
+export function mergeImportBatchIdempotent(
+  existingBatches: readonly SourceImportBatch[],
+  incomingBatch: SourceImportBatch
+): { readonly batches: SourceImportBatch[]; readonly wasDuplicateBatch: boolean } {
+  if (incomingBatch.source === 'pubmed') {
+    const withoutPrevPubmed = existingBatches.filter((b) => b.source !== 'pubmed');
+    return {
+      batches: [incomingBatch, ...withoutPrevPubmed],
+      wasDuplicateBatch: false
+    };
+  }
+
+  const alreadyImported = existingBatches.some(
+    (b) =>
+      b.batchId === incomingBatch.batchId ||
+      (Boolean(incomingBatch.contentHash) && b.contentHash === incomingBatch.contentHash)
+  );
+  if (alreadyImported) {
+    return {
+      batches: [...existingBatches],
+      wasDuplicateBatch: true
+    };
+  }
+
+  return {
+    batches: [...existingBatches, incomingBatch],
+    wasDuplicateBatch: false
+  };
+}
