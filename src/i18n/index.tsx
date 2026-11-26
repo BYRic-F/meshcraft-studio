@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState } from 'react';
+import type { MultiBaseCheckCode } from '../services/rustEngineService';
 
 export type LocaleCode = 'fr' | 'en';
 
@@ -89,6 +90,11 @@ export interface TranslationDictionary {
     readonly pubmedUnavailableValue: string;
     readonly auditObservationsTitle: string;
     readonly pressBreakdownTitle: string;
+    readonly auditMotherStrategyScopeHint: string;
+    readonly multiBaseCheckBadgeOffline: string;
+    readonly embaseCheckTitle: string;
+    readonly cochraneCheckTitle: string;
+    readonly multiBaseChecks: Readonly<Record<MultiBaseCheckCode, string>>;
     readonly showMoreSynonymsWord: string;
     readonly collapseSynonymsBtn: string;
     readonly freeTextConceptBadge: string;
@@ -478,8 +484,27 @@ export const frDictionary: TranslationDictionary = {
     strategyConvergedBadge: 'Stratégie convergée',
     pubmedErrorBannerPrefix: 'Interrogation PubMed interrompue :',
     pubmedUnavailableValue: 'Erreur',
-    auditObservationsTitle: 'Revue qualitative (PRISMA-S / PRESS)',
-    pressBreakdownTitle: 'Contrôles techniques PRESS',
+    auditObservationsTitle: 'Revue qualitative PRISMA-S / PRESS (Stratégie mère PubMed / MEDLINE)',
+    pressBreakdownTitle: 'Contrôles techniques PRESS (Stratégie mère PubMed)',
+    auditMotherStrategyScopeHint: 'L\'indice et l\'audit PRESS portent sur la stratégie mère PubMed / MEDLINE ; sélectionnez les onglets Embase.com ou Cochrane CENTRAL pour leur contrôle syntaxique déterministe.',
+    multiBaseCheckBadgeOffline: 'Contrôle déterministe hors-ligne',
+    embaseCheckTitle: 'Contrôle de traduction Embase.com (Emtree / syntaxe)',
+    cochraneCheckTitle: 'Contrôle de traduction Cochrane CENTRAL',
+    multiBaseChecks: {
+      embase_syntax_ok: 'Syntaxe Embase équilibrée (parenthèses, crochets et apostrophes valides).',
+      embase_syntax_unbalanced: 'Déséquilibre de parenthèses, crochets ou apostrophes détecté dans l\'équation Embase.',
+      embase_pubmed_tag_leak: 'Balise PubMed détectée ([Mesh], [TiAb], [tw], [pt] ou [dp]) : syntaxe incompatible avec Embase.com.',
+      embase_emtree_candidates_info: 'PRISMA-S : les descripteurs \'/exp et \'/de sont dérivés des concepts MeSH ; vérifiez leur correspondance exacte dans le thésaurus Emtree sur Embase.com.',
+      embase_inverted_comma_warning: 'Descripteur(s) avec virgule inversée NLM détecté(s) ({examples}) : vérifiez la forme exacte du terme Emtree dans Embase.com.',
+      embase_nonhuman_ok: 'Exclusion animale Embase conforme (\'nonhuman\'/exp présent avec \'animal\'/exp).',
+      embase_nonhuman_missing_warning: 'Filtre animal Cochrane actif mais \'nonhuman\'/exp absent : utilisez NOT ((\'animal\'/exp OR \'nonhuman\'/exp) NOT \'human\'/exp).',
+      cochrane_syntax_ok: 'Syntaxe Cochrane CENTRAL équilibrée ([mh "..."], :ti,ab,kw et parenthèses valides).',
+      cochrane_syntax_unbalanced: 'Déséquilibre de parenthèses, crochets ou guillemets détecté dans l\'équation Cochrane CENTRAL.',
+      cochrane_foreign_tag_leak: 'Balise PubMed ou Embase détectée ([Mesh], [tiab], /exp ou :ti,ab,kw,de) : syntaxe incompatible avec Cochrane CENTRAL.',
+      cochrane_animal_filter_ok: 'Exclusion animale Cochrane conforme (NOT ([mh "Animals"] NOT [mh "Humans"])).',
+      cochrane_animal_filter_missing_warning: 'Filtre animal Cochrane actif mais clause NOT ([mh "Animals"] NOT [mh "Humans"]) absente de l\'équation CENTRAL.',
+      cochrane_date_range_info: 'Les bornes de dates s\'appliquent directement via le filtre « Publication Year » de l\'interface Cochrane Library.'
+    },
     showMoreSynonymsWord: 'autres synonymes',
     collapseSynonymsBtn: 'Réduire',
     freeTextConceptBadge: 'Texte libre [tiab]',
@@ -877,8 +902,27 @@ export const enDictionary: TranslationDictionary = {
     strategyConvergedBadge: 'Strategy converged',
     pubmedErrorBannerPrefix: 'PubMed query failed:',
     pubmedUnavailableValue: 'Error',
-    auditObservationsTitle: 'Qualitative review (PRISMA-S / PRESS)',
-    pressBreakdownTitle: 'PRESS technical checks',
+    auditObservationsTitle: 'Qualitative review PRISMA-S / PRESS (Mother strategy PubMed / MEDLINE)',
+    pressBreakdownTitle: 'PRESS technical checks (PubMed mother strategy)',
+    auditMotherStrategyScopeHint: 'The PRESS score and review evaluate the PubMed / MEDLINE mother strategy; switch to the Embase.com or Cochrane CENTRAL tabs for their deterministic syntax checks.',
+    multiBaseCheckBadgeOffline: 'Offline deterministic check',
+    embaseCheckTitle: 'Embase.com translation check (Emtree / syntax)',
+    cochraneCheckTitle: 'Cochrane CENTRAL translation check',
+    multiBaseChecks: {
+      embase_syntax_ok: 'Balanced Embase syntax (parentheses, brackets, and quotes verified).',
+      embase_syntax_unbalanced: 'Unbalanced parentheses, brackets, or single quotes detected in the Embase query.',
+      embase_pubmed_tag_leak: 'PubMed field tag detected ([Mesh], [TiAb], [tw], [pt], or [dp]): incompatible with Embase.com.',
+      embase_emtree_candidates_info: 'PRISMA-S: \'/exp and \'/de descriptors are derived from MeSH concepts; verify their exact Emtree equivalents in Embase.com.',
+      embase_inverted_comma_warning: 'Descriptor(s) with NLM inverted comma detected ({examples}): verify the exact Emtree heading in Embase.com.',
+      embase_nonhuman_ok: 'Embase animal exclusion compliant (\'nonhuman\'/exp included alongside \'animal\'/exp).',
+      embase_nonhuman_missing_warning: 'Cochrane animal filter active but \'nonhuman\'/exp is missing: use NOT ((\'animal\'/exp OR \'nonhuman\'/exp) NOT \'human\'/exp).',
+      cochrane_syntax_ok: 'Balanced Cochrane CENTRAL syntax ([mh "..."], :ti,ab,kw, and parentheses verified).',
+      cochrane_syntax_unbalanced: 'Unbalanced parentheses, brackets, or quotes detected in the Cochrane CENTRAL query.',
+      cochrane_foreign_tag_leak: 'PubMed or Embase tag detected ([Mesh], [tiab], /exp, or :ti,ab,kw,de): incompatible with Cochrane CENTRAL.',
+      cochrane_animal_filter_ok: 'Cochrane animal exclusion compliant (NOT ([mh "Animals"] NOT [mh "Humans"])).',
+      cochrane_animal_filter_missing_warning: 'Cochrane animal filter active but NOT ([mh "Animals"] NOT [mh "Humans"]) is missing from the CENTRAL query.',
+      cochrane_date_range_info: 'Date bounds are applied directly using the native Publication Year filter in the Cochrane Library interface.'
+    },
     showMoreSynonymsWord: 'more synonyms',
     collapseSynonymsBtn: 'Collapse',
     freeTextConceptBadge: 'Free text [tiab]',

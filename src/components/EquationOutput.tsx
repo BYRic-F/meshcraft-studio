@@ -28,7 +28,10 @@ import {
   PressStatusLevel
 } from '../services/multiAgentWorkflow';
 import { AuditRefinementResult, isPassiveComparatorConcept } from '../services/localAiService';
-import { shouldDisplayStrategyConverged } from '../services/rustEngineService';
+import {
+  auditMultiBaseTranslationDeterministic,
+  shouldDisplayStrategyConverged
+} from '../services/rustEngineService';
 import { parseBenchmarkPmids, evaluateBenchmarkCoverage, BenchmarkCoverageResult } from '../services/rayyanAndMatrixService';
 import { useTranslation } from '../i18n';
 
@@ -129,6 +132,21 @@ export default function EquationOutput({
     : activeDbTab === 'embase'
       ? customEmbaseQuery
       : customCochraneQuery;
+
+  const hasHumansCochraneFilter = Boolean(settings?.filters?.includes('humans_cochrane'));
+  const hasDateRangeFilter = Boolean(
+    settings?.dateRange?.enabled ||
+      (settings?.dateRange?.startDate && settings?.dateRange?.endDate)
+  );
+  const multiBaseAudit =
+    activeDbTab === 'embase' || activeDbTab === 'cochrane'
+      ? auditMultiBaseTranslationDeterministic({
+          target: activeDbTab,
+          query: currentQueryText,
+          hasHumansCochraneFilter: hasHumansCochraneFilter,
+          hasDateRange: hasDateRangeFilter
+        })
+      : null;
 
   const handleCopy = (text: string, tabName: string) => {
     navigator.clipboard.writeText(text);
@@ -645,6 +663,58 @@ export default function EquationOutput({
               className="w-full rounded-xl border border-slate-200 bg-slate-50 p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words text-slate-900 focus:border-indigo-600 focus:bg-white focus:outline-none"
             />
 
+            {multiBaseAudit && (
+              <div
+                className={`rounded-xl border p-3.5 space-y-2 ${
+                  multiBaseAudit.hasWarnings
+                    ? 'bg-amber-50/50 border-amber-200'
+                    : 'bg-slate-50/80 border-slate-200'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-bold text-slate-800">
+                    {multiBaseAudit.target === 'embase'
+                      ? t.step2.embaseCheckTitle
+                      : t.step2.cochraneCheckTitle}
+                  </span>
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-white border border-slate-200 text-slate-600">
+                    {t.step2.multiBaseCheckBadgeOffline}
+                  </span>
+                </div>
+                <ul className="space-y-1.5 text-xs">
+                  {multiBaseAudit.checks.map((check) => {
+                    const template = t.step2.multiBaseChecks[check.code];
+                    const renderedText =
+                      check.examples && check.examples.length > 0
+                        ? template.replace('{examples}', check.examples.join(', '))
+                        : template;
+                    return (
+                      <li key={check.code} className="flex items-start gap-2 leading-relaxed">
+                        {check.severity === 'ok' ? (
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0 mt-0.5" />
+                        ) : check.severity === 'info' ? (
+                          <Info className="w-3.5 h-3.5 text-sky-600 shrink-0 mt-0.5" />
+                        ) : (
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                        )}
+                        <span
+                          className={
+                            check.severity === 'warning'
+                              ? 'text-amber-900 font-medium'
+                              : check.severity === 'info'
+                                ? 'text-slate-600'
+                                : 'text-slate-700'
+                          }
+                        >
+                          {renderedText}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            )}
+
             {(onPreviewAuditRefinement || (activeDbTab === 'pubmed' && isPubMedQueryModified && onUpdatePubMedQuery)) && (
               <div className="flex flex-wrap items-center justify-between gap-2.5 pt-1">
                 <div className="flex flex-wrap items-center gap-2">
@@ -799,6 +869,10 @@ export default function EquationOutput({
           {/* Synthèse détaillée de l'Indice PRESS & Revue qualitative */}
           {resultData?.critiqueReport && (
             <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-xs space-y-4">
+              <p className="text-[11px] text-slate-500 leading-relaxed flex items-start gap-1.5 pb-2.5 border-b border-slate-100">
+                <Info className="w-3.5 h-3.5 text-slate-400 shrink-0 mt-0.5" />
+                <span>{t.step2.auditMotherStrategyScopeHint}</span>
+              </p>
               {resultData.critiqueReport.pressBreakdown && resultData.critiqueReport.pressBreakdown.length > 0 && (
                 <div className="space-y-2.5">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">

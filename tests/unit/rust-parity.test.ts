@@ -203,6 +203,26 @@ describe('Parité stricte TS (compileAxisBlockRust) <-> Rust (compile_axis_block
         entryTerms: ['Mortality', 'Mortalities', 'mortality rate'],
         rawClinicalTokens: [],
         customTruncations: ['mortal*', 'mortality*', 'mortalities*']
+      },
+      // 7. Déduplication Embase 'descriptor'/exp lorsque plusieurs sous-descripteurs sont actifs
+      {
+        axisRole: 'pathology_outcome',
+        impliedSubheadings: [],
+        descriptors: [
+          {
+            descriptor: 'Parkinson Disease, Secondary',
+            meshId: 'D010302',
+            allowedSubheadings: ['chemically induced', 'drug therapy'],
+            selectedSubheadings: ['chemically induced', 'drug therapy'],
+            treeNumbers: ['C10.228.140.079.862.500'],
+            isPharmacologicalSubstance: false,
+            noExp: false,
+            isMajor: false
+          }
+        ],
+        entryTerms: ['secondary parkinsonism'],
+        rawClinicalTokens: [],
+        customTruncations: []
       }
     ];
 

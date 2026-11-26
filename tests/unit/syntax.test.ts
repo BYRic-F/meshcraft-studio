@@ -10,7 +10,8 @@ import {
   computeDerivationalStemsRust,
   filterInnArityTwRust,
   compileAxisBlockRust,
-  shouldDisplayStrategyConverged
+  shouldDisplayStrategyConverged,
+  auditMultiBaseTranslationDeterministic
 } from '../../src/services/rustEngineService';
 import { generatePrismaReportText, generatePrismaSummaryData } from '../../src/services/prismaReport';
 import { parsePubMedEfetchXml, selectStratifiedPmids, queryPubMedLive } from '../../src/services/pubmedApi';
@@ -2241,6 +2242,143 @@ describe('1. Tests Unitaires & Conformité Constitutionnelle (gemini.md)', () =>
             message: 'Connecté · gemini-pro-latest (120 ms)'
           }
         })
+      ).toBe(true);
+    });
+  });
+
+  describe('Lot 3 · Traduction Multi-Bases Embase / CENTRAL & Contrôleur Déterministe', () => {
+    const sampleBlocks: MappedBlock[] = [
+      {
+        picoType: 'P',
+        originalText: 'Parkinsonisme secondaire induit chimiquement',
+        descriptor: 'Parkinson Disease, Secondary',
+        meshId: 'D010302',
+        descriptors: [
+          { descriptor: 'Parkinson Disease, Secondary', meshId: 'D010302', noExp: false, isMajor: false }
+        ],
+        entryTerms: ['secondary parkinsonism'],
+        truncationTerms: [],
+        selectedQualifiers: ['chemically induced', 'drug therapy']
+      }
+    ];
+
+    it('applique NOT ((\'animal\'/exp OR \'nonhuman\'/exp) NOT \'human\'/exp) sur Embase et NOT ([mh "Animals"] NOT [mh "Humans"]) sur CENTRAL uniquement quand humans_cochrane est actif', () => {
+      const withCochraneFilter = buildQuerySyntax(sampleBlocks, {
+        strategy: 'balanced',
+        useTruncation: false,
+        filters: ['humans_cochrane']
+      });
+      expect(withCochraneFilter.embaseQuery).toContain(
+        "NOT (('animal'/exp OR 'nonhuman'/exp) NOT 'human'/exp)"
+      );
+      expect(withCochraneFilter.cochraneQuery).toContain(
+        'NOT ([mh "Animals"] NOT [mh "Humans"])'
+      );
+
+      const withoutCochraneFilter = buildQuerySyntax(sampleBlocks, {
+        strategy: 'balanced',
+        useTruncation: false,
+        filters: ['rct']
+      });
+      expect(withoutCochraneFilter.embaseQuery).not.toContain("'nonhuman'/exp");
+      expect(withoutCochraneFilter.cochraneQuery).not.toContain('[mh "Animals"]');
+      expect(withoutCochraneFilter.cochraneQuery).not.toContain('[mh "Humans"]');
+
+      const emptyFilters = buildQuerySyntax(sampleBlocks, {
+        strategy: 'balanced',
+        useTruncation: false,
+        filters: []
+      });
+      expect(emptyFilters.cochraneQuery).not.toContain('Animals');
+    });
+
+    it('déduplique \'descriptor\'/exp sur Embase lorsqu\'un descripteur possède plusieurs sous-descripteurs actifs', () => {
+      const compiled = compileAxisBlockRust({
+        axisRole: 'pathology_outcome',
+        impliedSubheadings: [],
+        descriptors: [
+          {
+            descriptor: 'Parkinson Disease, Secondary',
+            meshId: 'D010302',
+            allowedSubheadings: ['chemically induced', 'drug therapy'],
+            selectedSubheadings: ['chemically induced', 'drug therapy'],
+            treeNumbers: ['C10.228.140.079.862.500'],
+            isPharmacologicalSubstance: false,
+            noExp: false,
+            isMajor: false
+          }
+        ],
+        entryTerms: ['secondary parkinsonism'],
+        rawClinicalTokens: [],
+        customTruncations: []
+      });
+
+      const matches = compiled.embaseClause.match(/'parkinson disease, secondary'\/exp/g) || [];
+      expect(matches).toHaveLength(1);
+    });
+
+    it('contrôle déterministement Embase.com et Cochrane CENTRAL sans aucun appel LLM', () => {
+      const embaseClean = auditMultiBaseTranslationDeterministic({
+        target: 'embase',
+        query: "('low back pain'/exp OR 'low back pain':ti,ab,kw,de)\nNOT (('animal'/exp OR 'nonhuman'/exp) NOT 'human'/exp)",
+        hasHumansCochraneFilter: true
+      });
+      expect(embaseClean.hasWarnings).toBe(false);
+      expect(embaseClean.checks.map((c) => c.code)).toEqual([
+        'embase_syntax_ok',
+        'embase_emtree_candidates_info',
+        'embase_nonhuman_ok'
+      ]);
+
+      const embaseInverted = auditMultiBaseTranslationDeterministic({
+        target: 'embase',
+        query: "('parkinson disease, secondary'/exp OR 'secondary parkinsonism':ti,ab,kw,de)\nNOT ('animal'/exp NOT 'human'/exp)",
+        hasHumansCochraneFilter: true
+      });
+      expect(embaseInverted.hasWarnings).toBe(true);
+      const invertedCheck = embaseInverted.checks.find(
+        (c) => c.code === 'embase_inverted_comma_warning'
+      );
+      expect(invertedCheck?.examples).toContain("'parkinson disease, secondary'/exp");
+      expect(embaseInverted.checks.some((c) => c.code === 'embase_nonhuman_missing_warning')).toBe(
+        true
+      );
+
+      const embaseDefective = auditMultiBaseTranslationDeterministic({
+        target: 'embase',
+        query: '("Diabetes Mellitus"[Mesh] OR \'unclosed:ti,ab,kw,de)'
+      });
+      expect(embaseDefective.hasWarnings).toBe(true);
+      expect(embaseDefective.checks.some((c) => c.code === 'embase_pubmed_tag_leak')).toBe(true);
+      expect(embaseDefective.checks.some((c) => c.code === 'embase_syntax_unbalanced')).toBe(true);
+
+      const cochraneClean = auditMultiBaseTranslationDeterministic({
+        target: 'cochrane',
+        query: '([mh "Low Back Pain"] OR "low back pain":ti,ab,kw)\nNOT ([mh "Animals"] NOT [mh "Humans"])',
+        hasHumansCochraneFilter: true,
+        hasDateRange: true
+      });
+      expect(cochraneClean.hasWarnings).toBe(false);
+      expect(cochraneClean.checks.map((c) => c.code)).toEqual([
+        'cochrane_syntax_ok',
+        'cochrane_animal_filter_ok',
+        'cochrane_date_range_info'
+      ]);
+
+      const cochraneDefective = auditMultiBaseTranslationDeterministic({
+        target: 'cochrane',
+        query: "('low back pain'/exp OR [mh \"Low Back Pain\")",
+        hasHumansCochraneFilter: true
+      });
+      expect(cochraneDefective.hasWarnings).toBe(true);
+      expect(cochraneDefective.checks.some((c) => c.code === 'cochrane_foreign_tag_leak')).toBe(
+        true
+      );
+      expect(cochraneDefective.checks.some((c) => c.code === 'cochrane_syntax_unbalanced')).toBe(
+        true
+      );
+      expect(
+        cochraneDefective.checks.some((c) => c.code === 'cochrane_animal_filter_missing_warning')
       ).toBe(true);
     });
   });

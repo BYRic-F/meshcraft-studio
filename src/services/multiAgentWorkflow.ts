@@ -726,6 +726,7 @@ export function buildQuerySyntax(mappedBlocks: MappedBlock[], settings: Pipeline
   const embaseFilterElements: string[] = [];
   let pubmedAnimalExclusion = '';
   let embaseAnimalExclusion = '';
+  let cochraneAnimalExclusion = '';
 
   if (settings.filters && settings.filters.length > 0) {
     const pubmedStudyTypes: string[] = [];
@@ -743,7 +744,8 @@ export function buildQuerySyntax(mappedBlocks: MappedBlock[], settings: Pipeline
         embaseFilterElements.push(`'human'/exp`);
       } else if (f === 'humans_cochrane') {
         pubmedAnimalExclusion = `NOT ("Animals"[Mesh] NOT "Humans"[Mesh])`;
-        embaseAnimalExclusion = `NOT ('animal'/exp NOT 'human'/exp)`;
+        embaseAnimalExclusion = `NOT (('animal'/exp OR 'nonhuman'/exp) NOT 'human'/exp)`;
+        cochraneAnimalExclusion = `NOT ([mh "Animals"] NOT [mh "Humans"])`;
       } else if (f === 'last5') {
         pubmedFilterElements.push(`"last 5 years"[dp]`);
       }
@@ -798,6 +800,10 @@ export function buildQuerySyntax(mappedBlocks: MappedBlock[], settings: Pipeline
 
   if (embaseAnimalExclusion && fullEmbase.trim().length > 0) {
     fullEmbase += `\n${embaseAnimalExclusion}`;
+  }
+
+  if (cochraneAnimalExclusion && fullCochrane.trim().length > 0) {
+    fullCochrane += `\n${cochraneAnimalExclusion}`;
   }
 
   return {

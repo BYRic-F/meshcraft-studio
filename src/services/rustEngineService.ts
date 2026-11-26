@@ -525,6 +525,7 @@ export function compileAxisBlockRust(input: AxisCompilationInputRust): CompiledA
   const embaseParts: string[] = [];
   const centralParts: string[] = [];
   const seenMesh = new Set<string>();
+  const seenEmbase = new Set<string>();
 
   for (const node of input.descriptors) {
     const descClean = node.descriptor.trim();
@@ -543,7 +544,11 @@ export function compileAxisBlockRust(input: AxisCompilationInputRust): CompiledA
       if (!seenMesh.has(formatted)) {
         seenMesh.add(formatted);
         meshTermsEmitted.push(formatted);
-        embaseParts.push(`'${descClean.toLowerCase()}'/${node.noExp ? 'de' : 'exp'}`);
+        const embaseTerm = `'${descClean.toLowerCase()}'/${node.noExp ? 'de' : 'exp'}`;
+        if (!seenEmbase.has(embaseTerm)) {
+          seenEmbase.add(embaseTerm);
+          embaseParts.push(embaseTerm);
+        }
         centralParts.push(`[mh ${node.noExp ? '^' : ''}"${descClean}"]`);
       }
     } else {
@@ -552,7 +557,11 @@ export function compileAxisBlockRust(input: AxisCompilationInputRust): CompiledA
         if (!seenMesh.has(formatted)) {
           seenMesh.add(formatted);
           meshTermsEmitted.push(formatted);
-          embaseParts.push(`'${descClean.toLowerCase()}'/${node.noExp ? 'de' : 'exp'}`);
+          const embaseTerm = `'${descClean.toLowerCase()}'/${node.noExp ? 'de' : 'exp'}`;
+          if (!seenEmbase.has(embaseTerm)) {
+            seenEmbase.add(embaseTerm);
+            embaseParts.push(embaseTerm);
+          }
           centralParts.push(
             `[mh ${node.noExp ? '^' : ''}"${descClean}"/${subheadingToCentralCodeRust(sh)}]`
           );
@@ -1244,4 +1253,164 @@ export function shouldDisplayStrategyConverged(params: {
   if (params.hitCount <= 0) return false;
   if (params.pressStatus === 'revision_required') return false;
   return params.pressStatus === 'compliant' || params.refinementCount >= 2;
+}
+
+export type MultiBaseAuditTarget = 'embase' | 'cochrane';
+export type MultiBaseCheckSeverity = 'ok' | 'info' | 'warning';
+export type MultiBaseCheckCode =
+  | 'embase_syntax_ok'
+  | 'embase_syntax_unbalanced'
+  | 'embase_pubmed_tag_leak'
+  | 'embase_emtree_candidates_info'
+  | 'embase_inverted_comma_warning'
+  | 'embase_nonhuman_ok'
+  | 'embase_nonhuman_missing_warning'
+  | 'cochrane_syntax_ok'
+  | 'cochrane_syntax_unbalanced'
+  | 'cochrane_foreign_tag_leak'
+  | 'cochrane_animal_filter_ok'
+  | 'cochrane_animal_filter_missing_warning'
+  | 'cochrane_date_range_info';
+
+export interface MultiBaseTranslationCheck {
+  readonly code: MultiBaseCheckCode;
+  readonly severity: MultiBaseCheckSeverity;
+  readonly examples?: readonly string[];
+}
+
+export interface MultiBaseTranslationAuditResult {
+  readonly target: MultiBaseAuditTarget;
+  readonly hasWarnings: boolean;
+  readonly checks: readonly MultiBaseTranslationCheck[];
+}
+
+function areDelimitersBalanced(query: string, checkSingleQuotes: boolean): boolean {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let doubleQuotes = 0;
+  let singleQuotes = 0;
+
+  for (const ch of query) {
+    if (ch === '(') parenDepth += 1;
+    else if (ch === ')') {
+      parenDepth -= 1;
+      if (parenDepth < 0) return false;
+    } else if (ch === '[') bracketDepth += 1;
+    else if (ch === ']') {
+      bracketDepth -= 1;
+      if (bracketDepth < 0) return false;
+    } else if (ch === '"') doubleQuotes += 1;
+    else if (ch === "'") singleQuotes += 1;
+  }
+
+  if (parenDepth !== 0 || bracketDepth !== 0 || doubleQuotes % 2 !== 0) {
+    return false;
+  }
+  if (checkSingleQuotes && singleQuotes % 2 !== 0) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Contrôle déterministe 100 % hors-ligne (zéro appel LLM, zéro réseau) de la traduction
+ * booléenne Embase.com ou Cochrane CENTRAL affichée à l'Étape 2.
+ */
+export function auditMultiBaseTranslationDeterministic(params: {
+  readonly target: MultiBaseAuditTarget;
+  readonly query: string;
+  readonly hasHumansCochraneFilter?: boolean;
+  readonly hasDateRange?: boolean;
+}): MultiBaseTranslationAuditResult {
+  const trimmed = (params.query || '').trim();
+  const checks: MultiBaseTranslationCheck[] = [];
+
+  if (params.target === 'embase') {
+    const hasPubMedTagLeak = /\[(mesh|mh|majr|tiab|tw|pt|dp)\b/i.test(trimmed);
+    const isBalanced = trimmed.length > 0 && areDelimitersBalanced(trimmed, true);
+
+    if (hasPubMedTagLeak) {
+      checks.push({ code: 'embase_pubmed_tag_leak', severity: 'warning' });
+    }
+    if (!isBalanced) {
+      checks.push({ code: 'embase_syntax_unbalanced', severity: 'warning' });
+    }
+    if (!hasPubMedTagLeak && isBalanced) {
+      checks.push({ code: 'embase_syntax_ok', severity: 'ok' });
+    }
+
+    const emtreeRegex = /'([^']+)'\/(?:exp|de)\b/gi;
+    let emtreeCount = 0;
+    const invertedExamples: string[] = [];
+    const seenInverted = new Set<string>();
+    let match = emtreeRegex.exec(trimmed);
+    while (match !== null) {
+      emtreeCount += 1;
+      const fullTag = match[0];
+      const termInside = match[1] ?? '';
+      if (termInside.includes(',')) {
+        const dedupKey = fullTag.toLowerCase();
+        if (!seenInverted.has(dedupKey) && invertedExamples.length < 3) {
+          seenInverted.add(dedupKey);
+          invertedExamples.push(fullTag);
+        }
+      }
+      match = emtreeRegex.exec(trimmed);
+    }
+
+    if (emtreeCount > 0) {
+      checks.push({ code: 'embase_emtree_candidates_info', severity: 'info' });
+    }
+    if (invertedExamples.length > 0) {
+      checks.push({
+        code: 'embase_inverted_comma_warning',
+        severity: 'warning',
+        examples: invertedExamples
+      });
+    }
+
+    const expectsAnimalExclusion =
+      Boolean(params.hasHumansCochraneFilter) || /'animal'\/exp/i.test(trimmed);
+    if (expectsAnimalExclusion) {
+      if (/'nonhuman'\/exp/i.test(trimmed)) {
+        checks.push({ code: 'embase_nonhuman_ok', severity: 'ok' });
+      } else {
+        checks.push({ code: 'embase_nonhuman_missing_warning', severity: 'warning' });
+      }
+    }
+  } else {
+    const hasForeignTagLeak =
+      /\[(mesh|majr|tiab|tw|pt|dp)\b/i.test(trimmed) ||
+      /'[^']+'\/(?:exp|de)\b/i.test(trimmed) ||
+      /:ti,ab,kw,de\b/i.test(trimmed);
+    const isBalanced = trimmed.length > 0 && areDelimitersBalanced(trimmed, false);
+
+    if (hasForeignTagLeak) {
+      checks.push({ code: 'cochrane_foreign_tag_leak', severity: 'warning' });
+    }
+    if (!isBalanced) {
+      checks.push({ code: 'cochrane_syntax_unbalanced', severity: 'warning' });
+    }
+    if (!hasForeignTagLeak && isBalanced) {
+      checks.push({ code: 'cochrane_syntax_ok', severity: 'ok' });
+    }
+
+    if (params.hasHumansCochraneFilter) {
+      if (/NOT\s*\(\s*\[mh\s+"Animals"\]\s+NOT\s+\[mh\s+"Humans"\]\s*\)/i.test(trimmed)) {
+        checks.push({ code: 'cochrane_animal_filter_ok', severity: 'ok' });
+      } else {
+        checks.push({ code: 'cochrane_animal_filter_missing_warning', severity: 'warning' });
+      }
+    }
+
+    if (params.hasDateRange) {
+      checks.push({ code: 'cochrane_date_range_info', severity: 'info' });
+    }
+  }
+
+  return {
+    target: params.target,
+    hasWarnings: checks.some((c) => c.severity === 'warning'),
+    checks
+  };
 }

@@ -780,6 +780,7 @@ pub fn compile_axis_block_rust(input: &AxisCompilationInput) -> CompiledAxisOutp
     let mut embase_parts = Vec::<String>::new();
     let mut central_parts = Vec::<String>::new();
     let mut seen_mesh = HashSet::<String>::new();
+    let mut seen_embase = HashSet::<String>::new();
 
     // 1. Loi d'Absorption des Sous-Descripteurs :
     // Si un descripteur possède au moins un sous-descripteur actif, on émet UNIQUEMENT
@@ -802,11 +803,14 @@ pub fn compile_axis_block_rust(input: &AxisCompilationInput) -> CompiledAxisOutp
             let formatted = format!("\"{}\"{}", desc_clean, tag);
             if seen_mesh.insert(formatted.clone()) {
                 mesh_terms_emitted.push(formatted);
-                embase_parts.push(format!(
+                let embase_term = format!(
                     "'{}'/{}",
                     desc_clean.to_ascii_lowercase(),
                     if node.no_exp { "de" } else { "exp" }
-                ));
+                );
+                if seen_embase.insert(embase_term.clone()) {
+                    embase_parts.push(embase_term);
+                }
                 central_parts.push(format!(
                     "[mh {}\"{}\"]",
                     if node.no_exp { "^" } else { "" },
@@ -818,11 +822,14 @@ pub fn compile_axis_block_rust(input: &AxisCompilationInput) -> CompiledAxisOutp
                 let formatted = format!("\"{}/{}\"{}", desc_clean, sh, tag);
                 if seen_mesh.insert(formatted.clone()) {
                     mesh_terms_emitted.push(formatted);
-                    embase_parts.push(format!(
+                    let embase_term = format!(
                         "'{}'/{}",
                         desc_clean.to_ascii_lowercase(),
                         if node.no_exp { "de" } else { "exp" }
-                    ));
+                    );
+                    if seen_embase.insert(embase_term.clone()) {
+                        embase_parts.push(embase_term);
+                    }
                     central_parts.push(format!(
                         "[mh {}\"{}\"/{}]",
                         if node.no_exp { "^" } else { "" },
